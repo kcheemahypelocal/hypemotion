@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "2.0.0";
+  var VERSION = "2.1.0";
   var LIB = "HypeMotion";
 
   // ════════════════════════════════════════════════════════
@@ -15,15 +15,17 @@
     distance: 40,
     stagger: 0.08,
     delay: 0,
-    scrollStart: "top 88%",
-    observerMargin: "0px 0px -12% 0px",
+    // Trigger when the top of the element reaches 80% down
+    // the viewport — user clearly sees the element enter
+    scrollStart: "top 80%",
+    observerThreshold: 0.15,
+    observerMargin: "0px 0px -20% 0px",
     once: true,
     parallaxSpeed: 0.2,
     foicTimeout: 4000,
     gsapCDN: "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5",
   };
 
-  // Which animations belong to which tier
   var CSS_TIER = [
     "fade-up", "fade-down", "fade-left",
     "fade-right", "fade-in", "scale-in", "reveal-up",
@@ -33,16 +35,16 @@
     "img-reveal", "stagger-children", "counter",
     "draw-line", "parallax", "hero-text", "hero-image",
   ];
-  var BTN_TYPES = ["fill", "magnetic", "text-slide"];
 
   // ════════════════════════════════════════════════════════
-  // 2. STATE & TRACKING
+  // 2. STATE
   // ════════════════════════════════════════════════════════
 
   var state = {
     initialized: false,
     gsapLoaded: false,
     gsapLoading: false,
+    gsapPromise: null,
     reducedMotion: false,
     triggers: [],
     observers: [],
@@ -55,7 +57,24 @@
   // 3. UTILITIES
   // ════════════════════════════════════════════════════════
 
+  // Read a prefixed attribute: tries data-hm-X first, then data-X
+  // This avoids collision with Webflow's data-duration etc.
   function attr(el, name, fallback) {
+    // Prefer hm-prefixed version
+    var v = el.getAttribute("data-hm-" + name);
+    // Fall back to non-prefixed only for HypeMotion-specific attrs
+    if (v === null) {
+      v = el.getAttribute("data-" + name);
+    }
+    if (v === null) return fallback;
+    if (v === "true") return true;
+    if (v === "false") return false;
+    var n = parseFloat(v);
+    return isNaN(n) ? v : n;
+  }
+
+  // Read attributes that are always non-prefixed
+  function rawAttr(el, name, fallback) {
     var v = el.getAttribute("data-" + name);
     if (v === null) return fallback;
     if (v === "true") return true;
@@ -85,48 +104,125 @@
     };
   }
 
+  // Check if element is currently in the viewport
+  function isInViewport(el) {
+    var rect = el.getBoundingClientRect();
+    return (
+      rect.top < window.innerHeight &&
+      rect.bottom > 0 &&
+      rect.left < window.innerWidth &&
+      rect.right > 0
+    );
+  }
+
+  // ── GSAP helpers ───────────────────────────────────────
+
+  function getScrollStart(el) {
+    return rawAttr(el, "scroll-start", CONFIG.scrollStart);
+  }
+
+  function getOnce(el) {
+    return attr(el, "once", CONFIG.once);
+  }
+
+  function getDuration(el, fallback) {
+    // Only read hm-prefixed duration to avoid Webflow collision
+    var v = el.getAttribute("data-hm-duration");
+    if (v !== null) {
+      var n = parseFloat(v);
+      return isNaN(n) ? fallback : n;
+    }
+    return fallback;
+  }
+
+  function getDelay(el) {
+    var v = el.getAttribute("data-hm-delay");
+    if (v !== null) {
+      var n = parseFloat(v);
+      return isNaN(n) ? CONFIG.delay : n;
+    }
+    return CONFIG.delay;
+  }
+
+  function getDistance(el) {
+    var v = el.getAttribute("data-hm-distance");
+    if (v !== null) {
+      var n = parseFloat(v);
+      return isNaN(n) ? CONFIG.distance : n;
+    }
+    return CONFIG.distance;
+  }
+
+  function getStagger(el, fallback) {
+    var v = el.getAttribute("data-hm-stagger");
+    if (v !== null) {
+      var n = parseFloat(v);
+      return isNaN(n) ? fallback : n;
+    }
+    return fallback;
+  }
+
+  function getEase(el, fallback) {
+    var v = el.getAttribute("data-hm-ease");
+    return v || fallback;
+  }
+
   function scrollCfg(el) {
     return {
       trigger: el,
-      start: attr(el, "scroll-start", CONFIG.scrollStart),
-      toggleActions: attr(el, "once", CONFIG.once)
+      start: getScrollStart(el),
+      toggleActions: getOnce(el)
         ? "play none none none"
         : "play none none reverse",
     };
   }
 
-  function trackTrigger(st) {
-    if (st && st.scrollTrigger) state.triggers.push(st.scrollTrigger);
-    else if (st && st.vars && st.vars.scrollTrigger) state.triggers.push(st.scrollTrigger);
+  function trackTrigger(tween) {
+    if (tween && tween.scrollTrigger) {
+      state.triggers.push(tween.scrollTrigger);
+    }
   }
 
-  function fadeFrom(el, dir) {
-    var d = attr(el, "distance", CONFIG.distance);
+  // Build the from-values for directional fades
+  function fadeVars(el, dir) {
+    var d = getDistance(el);
     var base = {
       opacity: 0,
-      duration: attr(el, "duration", CONFIG.duration),
-      ease: attr(el, "ease", CONFIG.ease),
-      delay: attr(el, "delay", CONFIG.delay),
+      duration: getDuration(el, CONFIG.duration),
+      ease: getEase(el, CONFIG.ease),
+      delay: getDelay(el),
     };
-    if (dir === "up") return Object.assign(base, { y: d });
-    if (dir === "down") return Object.assign(base, { y: -d });
-    if (dir === "left") return Object.assign(base, { x: -d });
-    if (dir === "right") return Object.assign(base, { x: d });
+    if (dir === "up") { base.y = d; }
+    else if (dir === "down") { base.y = -d; }
+    else if (dir === "left") { base.x = -d; }
+    else if (dir === "right") { base.x = d; }
     return base;
+  }
+
+  // Set the initial hidden state on an element so there's
+  // no flash before ScrollTrigger takes over
+  function setInitialState(el, dir) {
+    var d = getDistance(el);
+    var props = { opacity: 0 };
+    if (dir === "up") { props.y = d; }
+    else if (dir === "down") { props.y = -d; }
+    else if (dir === "left") { props.x = -d; }
+    else if (dir === "right") { props.x = d; }
+    gsap.set(el, props);
   }
 
   // ════════════════════════════════════════════════════════
   // 4. SAFETY SYSTEMS
   // ════════════════════════════════════════════════════════
 
-  // ── 4a. Flash of Invisible Content Protection ──────────
-
   function injectSafetyCSS() {
     var style = document.createElement("style");
     style.id = "hm-safety-css";
     style.textContent = [
+      // Only hide when JS is running
       ".hm-loading [data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
       "  opacity: 0; }",
+      // Force visible if something goes wrong
       ".hm-fallback [data-animate] {",
       "  opacity: 1 !important;",
       "  transform: none !important;",
@@ -139,19 +235,17 @@
     setTimeout(function () {
       if (!state.initialized) {
         document.documentElement.classList.add("hm-fallback");
-        warn("Init timeout — fallback activated, content made visible.");
+        warn("Init timeout — fallback activated, content forced visible.");
       }
     }, CONFIG.foicTimeout);
   }
-
-  // ── 4b. Reduced Motion Detection ──────────────────────
 
   function checkReducedMotion() {
     var mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     state.reducedMotion = mq.matches;
     mq.addEventListener("change", function (e) {
       state.reducedMotion = e.matches;
-      if (e.matches) log("Reduced motion enabled — animations simplified.");
+      if (e.matches) { log("Reduced motion enabled."); }
     });
   }
 
@@ -160,92 +254,97 @@
     return el.getAttribute("data-motion") === "essential";
   }
 
-  // ── 4c. Webflow Interaction Conflict Detection ────────
-
   function checkConflicts(el) {
     if (el.getAttribute("data-w-id")) {
       warn(
-        'Element has both data-animate and a Webflow Interaction (data-w-id). ' +
-        'These may conflict. Remove one. Element: ' +
-        (el.className || el.tagName)
+        "Conflict: element has both data-animate and Webflow Interaction " +
+        "(data-w-id). Remove the Webflow Interaction or the data-animate " +
+        "attribute. Element: " + (el.className || el.tagName)
       );
     }
   }
 
   // ════════════════════════════════════════════════════════
-  // 5. CSS TIER — Zero Dependencies
+  // 5. CSS TIER
   // ════════════════════════════════════════════════════════
 
   function injectCSSTier() {
     var style = document.createElement("style");
     style.id = "hm-css-animations";
     style.textContent = [
+      // ── Keyframes ──
       "@keyframes hm-fade-up {",
-      "  from { opacity:0; transform: translateY(var(--hm-dist, 40px)); }",
-      "  to { opacity:1; transform: translateY(0); } }",
+      "  from { opacity:0; transform:translateY(var(--hm-dist,40px)); }",
+      "  to { opacity:1; transform:translateY(0); } }",
 
       "@keyframes hm-fade-down {",
-      "  from { opacity:0; transform: translateY(calc(var(--hm-dist, 40px) * -1)); }",
-      "  to { opacity:1; transform: translateY(0); } }",
+      "  from { opacity:0; transform:translateY(calc(var(--hm-dist,40px) * -1)); }",
+      "  to { opacity:1; transform:translateY(0); } }",
 
       "@keyframes hm-fade-left {",
-      "  from { opacity:0; transform: translateX(calc(var(--hm-dist, 40px) * -1)); }",
-      "  to { opacity:1; transform: translateX(0); } }",
+      "  from { opacity:0; transform:translateX(calc(var(--hm-dist,40px) * -1)); }",
+      "  to { opacity:1; transform:translateX(0); } }",
 
       "@keyframes hm-fade-right {",
-      "  from { opacity:0; transform: translateX(var(--hm-dist, 40px)); }",
-      "  to { opacity:1; transform: translateX(0); } }",
+      "  from { opacity:0; transform:translateX(var(--hm-dist,40px)); }",
+      "  to { opacity:1; transform:translateX(0); } }",
 
       "@keyframes hm-fade-in {",
       "  from { opacity:0; }",
       "  to { opacity:1; } }",
 
       "@keyframes hm-scale-in {",
-      "  from { opacity:0; transform: scale(0.9); }",
-      "  to { opacity:1; transform: scale(1); } }",
+      "  from { opacity:0; transform:scale(0.9); }",
+      "  to { opacity:1; transform:scale(1); } }",
 
       "@keyframes hm-reveal-up {",
-      "  from { clip-path: inset(100% 0% 0% 0%); }",
-      "  to { clip-path: inset(0% 0% 0% 0%); } }",
+      "  from { clip-path:inset(100% 0% 0% 0%); }",
+      "  to { clip-path:inset(0% 0% 0% 0%); } }",
 
+      // ── Animation classes ──
       ".hm-in[data-animate='fade-up'] {",
-      "  animation: hm-fade-up var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-fade-up var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-down'] {",
-      "  animation: hm-fade-down var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-fade-down var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-left'] {",
-      "  animation: hm-fade-left var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-fade-left var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-right'] {",
-      "  animation: hm-fade-right var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-fade-right var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-in'] {",
-      "  animation: hm-fade-in var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-fade-in var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='scale-in'] {",
-      "  animation: hm-scale-in var(--hm-dur, 0.8s) var(--hm-ease, cubic-bezier(0.33,1,0.68,1)) var(--hm-del, 0s) both; }",
+      "  animation:hm-scale-in var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='reveal-up'] {",
-      "  animation: hm-reveal-up var(--hm-dur, 1s) cubic-bezier(0.76,0,0.24,1) var(--hm-del, 0s) both; }",
+      "  animation:hm-reveal-up var(--hm-dur,1s) cubic-bezier(0.76,0,0.24,1) var(--hm-del,0s) both; }",
 
-      "@media (prefers-reduced-motion: reduce) {",
+      // ── Above fold: already visible elements animate immediately ──
+      ".hm-visible[data-animate] {",
+      "  opacity:1 !important; transform:none !important; clip-path:none !important; }",
+
+      // ── Reduced motion ──
+      "@media (prefers-reduced-motion:reduce) {",
       "  [data-animate]:not([data-motion='essential']) {",
-      "    animation-duration: 0.01ms !important;",
-      "    transition-duration: 0.01ms !important; }",
+      "    animation-duration:0.01ms !important;",
+      "    transition-duration:0.01ms !important; }",
       "  .hm-in[data-animate]:not([data-motion='essential']) {",
-      "    opacity: 1; transform: none; clip-path: none; } }",
+      "    opacity:1; transform:none; clip-path:none; } }",
     ].join("\n");
     document.head.appendChild(style);
   }
 
   function applyCSSOverrides(el) {
-    var d = el.getAttribute("data-duration");
-    var del = el.getAttribute("data-delay");
-    var dist = el.getAttribute("data-distance");
-    if (d) el.style.setProperty("--hm-dur", d + "s");
-    if (del) el.style.setProperty("--hm-del", del + "s");
-    if (dist) el.style.setProperty("--hm-dist", dist + "px");
+    var d = el.getAttribute("data-hm-duration");
+    var del = el.getAttribute("data-hm-delay");
+    var dist = el.getAttribute("data-hm-distance");
+    if (d) { el.style.setProperty("--hm-dur", d + "s"); }
+    if (del) { el.style.setProperty("--hm-del", del + "s"); }
+    if (dist) { el.style.setProperty("--hm-dist", dist + "px"); }
   }
 
   function initCSSTier(elements) {
@@ -256,15 +355,20 @@
         entries.forEach(function (entry) {
           if (entry.isIntersecting) {
             entry.target.classList.add("hm-in");
-            var once = attr(entry.target, "once", CONFIG.once);
-            if (once) observer.unobserve(entry.target);
+            if (getOnce(entry.target)) {
+              observer.unobserve(entry.target);
+            }
           } else {
-            var once = attr(entry.target, "once", CONFIG.once);
-            if (!once) entry.target.classList.remove("hm-in");
+            if (!getOnce(entry.target)) {
+              entry.target.classList.remove("hm-in");
+            }
           }
         });
       },
-      { rootMargin: CONFIG.observerMargin, threshold: 0 }
+      {
+        rootMargin: CONFIG.observerMargin,
+        threshold: CONFIG.observerThreshold,
+      }
     );
 
     elements.forEach(function (el) {
@@ -272,15 +376,23 @@
         el.style.opacity = "1";
         return;
       }
+
       applyCSSOverrides(el);
-      observer.observe(el);
+
+      // If element is already in viewport on page load,
+      // show it immediately — don't animate on scroll
+      if (isInViewport(el)) {
+        el.classList.add("hm-visible");
+      } else {
+        observer.observe(el);
+      }
     });
 
     state.observers.push(observer);
   }
 
   // ════════════════════════════════════════════════════════
-  // 6. DYNAMIC GSAP LOADER
+  // 6. GSAP LOADER
   // ════════════════════════════════════════════════════════
 
   function loadScript(src) {
@@ -300,12 +412,33 @@
     if (state.gsapLoaded) return Promise.resolve();
     if (state.gsapLoading) return state.gsapPromise;
 
+    // GSAP already on the page (added manually or by Webflow)
     if (window.gsap && window.ScrollTrigger) {
       state.gsapLoaded = true;
       gsap.registerPlugin(ScrollTrigger);
+      log("Using existing GSAP on page.");
       return Promise.resolve();
     }
 
+    // GSAP exists but ScrollTrigger doesn't
+    if (window.gsap && !window.ScrollTrigger) {
+      state.gsapLoading = true;
+      state.gsapPromise = loadScript(CONFIG.gsapCDN + "/ScrollTrigger.min.js")
+        .then(function () {
+          gsap.registerPlugin(ScrollTrigger);
+          state.gsapLoaded = true;
+          state.gsapLoading = false;
+          log("ScrollTrigger loaded (GSAP was already present).");
+        })
+        .catch(function (err) {
+          state.gsapLoading = false;
+          warn("ScrollTrigger failed to load: " + err.message);
+          document.documentElement.classList.add("hm-fallback");
+        });
+      return state.gsapPromise;
+    }
+
+    // Load both
     state.gsapLoading = true;
     state.gsapPromise = loadScript(CONFIG.gsapCDN + "/gsap.min.js")
       .then(function () {
@@ -315,7 +448,7 @@
         gsap.registerPlugin(ScrollTrigger);
         state.gsapLoaded = true;
         state.gsapLoading = false;
-        log("GSAP loaded dynamically (required by page content).");
+        log("GSAP + ScrollTrigger loaded dynamically.");
       })
       .catch(function (err) {
         state.gsapLoading = false;
@@ -327,38 +460,43 @@
   }
 
   // ════════════════════════════════════════════════════════
-  // 7. TEXT SPLITTER — HTML-Preserving
+  // 7. TEXT SPLITTER
   // ════════════════════════════════════════════════════════
 
   function splitContent(el, type) {
     el.setAttribute("aria-label", el.textContent);
-    var hasBR = el.querySelector("br");
-    var hasHTML = el.querySelector("a, strong, em, span, b, i, u, mark, sup, sub");
 
+    var hasHTML = el.querySelector("a, strong, em, span, b, i, u, mark, sup, sub");
     if (hasHTML) {
       warn(
-        'Element with data-animate="split-' + type + '" contains inline HTML ' +
-        "(links, bold, etc). HTML structure is preserved but results may vary. " +
-        "Element: " + el.textContent.substring(0, 40) + "..."
+        "split-" + type + ": element contains inline HTML. " +
+        "Structure preserved but results may vary. Text: \"" +
+        el.textContent.substring(0, 40) + "...\""
       );
     }
 
-    if (type === "lines") return splitLines(el, hasBR);
+    if (type === "lines") return splitLines(el);
     if (type === "words") return splitWords(el);
     if (type === "chars") return splitChars(el);
+    return null;
   }
 
-  function splitLines(el, hasBR) {
+  function splitLines(el) {
+    var hasBR = el.querySelector("br");
+
+    // Use <br> tags as explicit line boundaries
     if (hasBR) {
       var html = el.innerHTML;
       var parts = html.split(/<br\s*\/?>/gi);
       el.innerHTML = "";
       parts.forEach(function (part) {
+        var trimmed = part.trim();
+        if (!trimmed) return;
         var outer = document.createElement("span");
         outer.style.display = "block";
         outer.style.overflow = "hidden";
         var inner = document.createElement("span");
-        inner.innerHTML = part.trim();
+        inner.innerHTML = trimmed;
         inner.style.display = "inline-block";
         inner.classList.add("hm-line");
         outer.appendChild(inner);
@@ -367,11 +505,12 @@
       return el.querySelectorAll(".hm-line");
     }
 
-    var words = [];
+    // Measure visual lines by word position
+    var measuredWords = [];
     walkTextNodes(el, function (textNode) {
-      var parts = textNode.textContent.split(/(\s+)/);
+      var fragments = textNode.textContent.split(/(\s+)/);
       var frag = document.createDocumentFragment();
-      parts.forEach(function (p) {
+      fragments.forEach(function (p) {
         if (/^\s+$/.test(p)) {
           frag.appendChild(document.createTextNode(p));
         } else if (p) {
@@ -380,39 +519,41 @@
           s.className = "hm-measure";
           s.style.display = "inline";
           frag.appendChild(s);
-          words.push(s);
+          measuredWords.push(s);
         }
       });
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
-    var lines = [];
-    var curLine = [];
-    var curTop = null;
-    words.forEach(function (w) {
+    // Group by visual line (same offsetTop)
+    var lineGroups = [];
+    var currentGroup = [];
+    var currentTop = null;
+    measuredWords.forEach(function (w) {
       var top = w.getBoundingClientRect().top;
-      if (curTop === null || Math.abs(top - curTop) < 4) {
-        curLine.push(w);
-        if (curTop === null) curTop = top;
+      if (currentTop === null || Math.abs(top - currentTop) < 4) {
+        currentGroup.push(w);
+        if (currentTop === null) currentTop = top;
       } else {
-        lines.push(curLine);
-        curLine = [w];
-        curTop = top;
+        lineGroups.push(currentGroup);
+        currentGroup = [w];
+        currentTop = top;
       }
     });
-    if (curLine.length) lines.push(curLine);
+    if (currentGroup.length) lineGroups.push(currentGroup);
 
+    // Rebuild with line wrappers
     el.innerHTML = "";
-    lines.forEach(function (lineWords) {
+    lineGroups.forEach(function (words) {
       var outer = document.createElement("span");
       outer.style.display = "block";
       outer.style.overflow = "hidden";
       var inner = document.createElement("span");
       inner.style.display = "inline-block";
       inner.classList.add("hm-line");
-      lineWords.forEach(function (w, i) {
+      words.forEach(function (w, i) {
         inner.appendChild(document.createTextNode(w.textContent));
-        if (i < lineWords.length - 1) {
+        if (i < words.length - 1) {
           inner.appendChild(document.createTextNode(" "));
         }
       });
@@ -425,9 +566,9 @@
 
   function splitWords(el) {
     walkTextNodes(el, function (textNode) {
-      var parts = textNode.textContent.split(/(\s+)/);
+      var fragments = textNode.textContent.split(/(\s+)/);
       var frag = document.createDocumentFragment();
-      parts.forEach(function (p) {
+      fragments.forEach(function (p) {
         if (/^\s+$/.test(p)) {
           frag.appendChild(document.createTextNode(p));
         } else if (p) {
@@ -441,12 +582,15 @@
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
-    el.querySelectorAll("a, strong, em, span:not(.hm-word), b, i").forEach(function (node) {
-      if (!node.classList.contains("hm-word")) {
-        node.style.display = "inline-block";
-        node.classList.add("hm-word");
+    // Make existing inline elements animatable
+    el.querySelectorAll("a, strong, em, span:not(.hm-word), b, i").forEach(
+      function (node) {
+        if (!node.classList.contains("hm-word")) {
+          node.style.display = "inline-block";
+          node.classList.add("hm-word");
+        }
       }
-    });
+    );
 
     return el.querySelectorAll(".hm-word");
   }
@@ -485,97 +629,157 @@
   }
 
   function walkTextNodes(el, callback) {
-    var textNodes = [];
-    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-    while (walker.nextNode()) textNodes.push(walker.currentNode);
-    textNodes.forEach(callback);
+    var nodes = [];
+    var walker = document.createTreeWalker(
+      el, NodeFilter.SHOW_TEXT, null, false
+    );
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(callback);
   }
 
   // ════════════════════════════════════════════════════════
-  // 8. GSAP TIER — SCROLL ANIMATIONS
+  // 8. GSAP SCROLL ANIMATIONS
   // ════════════════════════════════════════════════════════
 
   var gsapScrollAnims = {
+
+    // ── Directional fades ────────────────────────────────
+    // Each sets the initial hidden state explicitly with
+    // gsap.set() THEN creates the animation with fromTo()
+    // to prevent any flash of unstyled content.
+
     "fade-up": function (el) {
-      var t = gsap.from(el, Object.assign(fadeFrom(el, "up"), { scrollTrigger: scrollCfg(el) }));
+      setInitialState(el, "up");
+      var t = gsap.to(el, {
+        opacity: 1, y: 0,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
       trackTrigger(t);
     },
+
     "fade-down": function (el) {
-      var t = gsap.from(el, Object.assign(fadeFrom(el, "down"), { scrollTrigger: scrollCfg(el) }));
+      setInitialState(el, "down");
+      var t = gsap.to(el, {
+        opacity: 1, y: 0,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
       trackTrigger(t);
     },
+
     "fade-left": function (el) {
-      var t = gsap.from(el, Object.assign(fadeFrom(el, "left"), { scrollTrigger: scrollCfg(el) }));
+      setInitialState(el, "left");
+      var t = gsap.to(el, {
+        opacity: 1, x: 0,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
       trackTrigger(t);
     },
+
     "fade-right": function (el) {
-      var t = gsap.from(el, Object.assign(fadeFrom(el, "right"), { scrollTrigger: scrollCfg(el) }));
+      setInitialState(el, "right");
+      var t = gsap.to(el, {
+        opacity: 1, x: 0,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
       trackTrigger(t);
     },
+
     "fade-in": function (el) {
-      var t = gsap.from(el, Object.assign(fadeFrom(el, "none"), { scrollTrigger: scrollCfg(el) }));
+      gsap.set(el, { opacity: 0 });
+      var t = gsap.to(el, {
+        opacity: 1,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
       trackTrigger(t);
     },
+
     "scale-in": function (el) {
-      var t = gsap.from(el, {
-        opacity: 0, scale: 0.9,
-        duration: attr(el, "duration", CONFIG.duration),
-        ease: attr(el, "ease", CONFIG.ease),
-        delay: attr(el, "delay", CONFIG.delay),
+      gsap.set(el, { opacity: 0, scale: 0.9 });
+      var t = gsap.to(el, {
+        opacity: 1, scale: 1,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
       });
       trackTrigger(t);
     },
+
     "reveal-up": function (el) {
-      var t = gsap.from(el, {
-        clipPath: "inset(100% 0% 0% 0%)",
-        duration: attr(el, "duration", 1),
-        ease: attr(el, "ease", "power4.inOut"),
-        delay: attr(el, "delay", CONFIG.delay),
+      gsap.set(el, { clipPath: "inset(100% 0% 0% 0%)" });
+      var t = gsap.to(el, {
+        clipPath: "inset(0% 0% 0% 0%)",
+        duration: getDuration(el, 1),
+        ease: getEase(el, "power4.inOut"),
+        delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
       });
       trackTrigger(t);
     },
+
+    // ── Text splits ──────────────────────────────────────
 
     "split-lines": function (el) {
       var parts = splitContent(el, "lines");
       if (!parts || !parts.length) return;
-      gsap.from(parts, {
-        y: "110%", opacity: 0,
-        duration: attr(el, "duration", 0.9),
-        ease: attr(el, "ease", "power3.out"),
-        stagger: attr(el, "stagger", 0.12),
-        delay: attr(el, "delay", CONFIG.delay),
-        scrollTrigger: scrollCfg(el),
-      });
-    },
-    "split-words": function (el) {
-      var parts = splitContent(el, "words");
-      if (!parts || !parts.length) return;
-      gsap.from(parts, {
-        y: 20, opacity: 0,
-        duration: attr(el, "duration", 0.6),
-        ease: attr(el, "ease", "power2.out"),
-        stagger: attr(el, "stagger", 0.04),
-        delay: attr(el, "delay", CONFIG.delay),
-        scrollTrigger: scrollCfg(el),
-      });
-    },
-    "split-chars": function (el) {
-      var parts = splitContent(el, "chars");
-      if (!parts || !parts.length) return;
-      gsap.from(parts, {
-        y: 15, opacity: 0,
-        duration: attr(el, "duration", 0.5),
-        ease: attr(el, "ease", "power2.out"),
-        stagger: attr(el, "stagger", 0.02),
-        delay: attr(el, "delay", CONFIG.delay),
+      gsap.set(parts, { y: "110%", opacity: 0 });
+      gsap.to(parts, {
+        y: "0%", opacity: 1,
+        duration: getDuration(el, 0.9),
+        ease: getEase(el, "power3.out"),
+        stagger: getStagger(el, 0.12),
+        delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
       });
     },
 
+    "split-words": function (el) {
+      var parts = splitContent(el, "words");
+      if (!parts || !parts.length) return;
+      gsap.set(parts, { y: 20, opacity: 0 });
+      gsap.to(parts, {
+        y: 0, opacity: 1,
+        duration: getDuration(el, 0.6),
+        ease: getEase(el, "power2.out"),
+        stagger: getStagger(el, 0.04),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
+    },
+
+    "split-chars": function (el) {
+      var parts = splitContent(el, "chars");
+      if (!parts || !parts.length) return;
+      gsap.set(parts, { y: 15, opacity: 0 });
+      gsap.to(parts, {
+        y: 0, opacity: 1,
+        duration: getDuration(el, 0.5),
+        ease: getEase(el, "power2.out"),
+        stagger: getStagger(el, 0.02),
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+      });
+    },
+
+    // ── Image reveal ─────────────────────────────────────
+
     "img-reveal": function (el) {
-      var dir = attr(el, "reveal-direction", "left");
+      var dir = rawAttr(el, "reveal-direction", "left");
       var clipFrom, clipTo;
 
       switch (dir) {
@@ -591,7 +795,8 @@
           clipFrom = "inset(0 0 100% 0)";
           clipTo = "inset(0 0 0% 0)";
           break;
-        case "bottom": default:
+        case "bottom":
+        default:
           clipFrom = "inset(100% 0 0 0)";
           clipTo = "inset(0% 0 0 0)";
           break;
@@ -601,44 +806,61 @@
 
       var tl = gsap.timeline({
         scrollTrigger: scrollCfg(el),
-        delay: attr(el, "delay", CONFIG.delay),
+        delay: getDelay(el),
       });
 
       tl.to(el, {
         clipPath: clipTo,
-        duration: attr(el, "duration", 1),
-        ease: attr(el, "ease", "power4.inOut"),
-      }).to(el, {
-        scale: 1,
-        duration: 1.2,
-        ease: "power2.out",
-      }, "<0.3");
+        duration: getDuration(el, 1),
+        ease: getEase(el, "power4.inOut"),
+      }).to(
+        el,
+        { scale: 1, duration: 1.2, ease: "power2.out" },
+        "<0.3"
+      );
+
+      if (tl.scrollTrigger) state.triggers.push(tl.scrollTrigger);
     },
+
+    // ── Stagger children ─────────────────────────────────
 
     "stagger-children": function (el) {
-      var selector = attr(el, "stagger-selector", null);
-      var children = selector
-        ? el.querySelectorAll(selector)
-        : el.children;
+      var selector = rawAttr(el, "stagger-selector", null);
+      var children;
 
-      if (!children.length) return;
+      if (selector) {
+        children = el.querySelectorAll(selector);
+      } else {
+        children = el.children;
+      }
 
-      gsap.from(children, {
+      if (!children || !children.length) return;
+
+      gsap.set(children, {
         opacity: 0,
-        y: attr(el, "distance", 30),
-        duration: attr(el, "duration", CONFIG.duration),
-        ease: attr(el, "ease", CONFIG.ease),
-        stagger: attr(el, "stagger", CONFIG.stagger),
-        delay: attr(el, "delay", CONFIG.delay),
+        y: getDistance(el),
+      });
+
+      var t = gsap.to(children, {
+        opacity: 1,
+        y: 0,
+        duration: getDuration(el, CONFIG.duration),
+        ease: getEase(el, CONFIG.ease),
+        stagger: getStagger(el, CONFIG.stagger),
+        delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
       });
+      trackTrigger(t);
     },
+
+    // ── Counter ──────────────────────────────────────────
 
     counter: function (el) {
       var raw = el.textContent.trim();
       var match = raw.match(/^([^0-9]*?)([\d,]+\.?\d*)(.*?)$/);
+
       if (!match) {
-        warn('Counter: could not parse number from "' + raw + '"');
+        warn("Counter: cannot parse \"" + raw + "\"");
         return;
       }
 
@@ -654,14 +876,17 @@
 
       gsap.to(obj, {
         val: target,
-        duration: attr(el, "duration", 2),
-        ease: attr(el, "ease", "power2.out"),
-        delay: attr(el, "delay", CONFIG.delay),
+        duration: getDuration(el, 2),
+        ease: getEase(el, "power2.out"),
+        delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
         onUpdate: function () {
-          var display = decimals
-            ? obj.val.toFixed(decimals)
-            : Math.round(obj.val).toString();
+          var display;
+          if (decimals) {
+            display = obj.val.toFixed(decimals);
+          } else {
+            display = Math.round(obj.val).toString();
+          }
           if (useCommas) {
             display = parseFloat(display).toLocaleString("en-US", {
               minimumFractionDigits: decimals,
@@ -673,29 +898,43 @@
       });
     },
 
+    // ── SVG draw ─────────────────────────────────────────
+
     "draw-line": function (el) {
-      var paths = el.querySelectorAll("path, line, circle, rect, polyline, polygon");
+      var paths = el.querySelectorAll(
+        "path, line, circle, rect, polyline, polygon"
+      );
       paths.forEach(function (p) {
         var len = p.getTotalLength ? p.getTotalLength() : 0;
         if (!len) return;
-        gsap.set(p, { strokeDasharray: len, strokeDashoffset: len });
+        gsap.set(p, {
+          strokeDasharray: len,
+          strokeDashoffset: len,
+        });
         gsap.to(p, {
           strokeDashoffset: 0,
-          duration: attr(el, "duration", 1.5),
-          ease: attr(el, "ease", "power2.inOut"),
-          delay: attr(el, "delay", CONFIG.delay),
+          duration: getDuration(el, 1.5),
+          ease: getEase(el, "power2.inOut"),
+          delay: getDelay(el),
           scrollTrigger: scrollCfg(el),
         });
       });
     },
 
+    // ── Parallax ─────────────────────────────────────────
+
     parallax: function (el) {
-      var speed = attr(el, "parallax-speed", CONFIG.parallaxSpeed);
-      if (window.innerWidth < 768 && !el.getAttribute("data-parallax-mobile")) {
+      var speed = rawAttr(el, "parallax-speed", CONFIG.parallaxSpeed);
+
+      // Skip on mobile unless explicitly enabled
+      if (window.innerWidth < 768 && !el.hasAttribute("data-parallax-mobile")) {
         return;
       }
+
       gsap.to(el, {
-        y: function () { return speed * 100; },
+        y: function () {
+          return speed * 100;
+        },
         ease: "none",
         scrollTrigger: {
           trigger: el,
@@ -708,37 +947,40 @@
   };
 
   // ════════════════════════════════════════════════════════
-  // 9. GSAP TIER — LOAD ANIMATIONS (Hero)
+  // 9. GSAP LOAD ANIMATIONS (Hero)
   // ════════════════════════════════════════════════════════
 
   var gsapLoadAnims = {
     "hero-text": function (el) {
       var parts = splitContent(el, "lines");
       if (!parts || !parts.length) return;
-      gsap.from(parts, {
-        y: "110%",
-        duration: attr(el, "duration", 1),
-        ease: attr(el, "ease", "power4.out"),
-        stagger: attr(el, "stagger", 0.15),
-        delay: attr(el, "delay", 0.3),
+      gsap.set(parts, { y: "110%", opacity: 0 });
+      gsap.to(parts, {
+        y: "0%", opacity: 1,
+        duration: getDuration(el, 1),
+        ease: getEase(el, "power4.out"),
+        stagger: getStagger(el, 0.15),
+        delay: getDelay(el) || 0.3,
       });
     },
+
     "hero-image": function (el) {
-      gsap.from(el, {
-        opacity: 0,
-        scale: 1.05,
-        duration: attr(el, "duration", 1.4),
-        ease: attr(el, "ease", "power3.out"),
-        delay: attr(el, "delay", 0.2),
+      gsap.set(el, { opacity: 0, scale: 1.05 });
+      gsap.to(el, {
+        opacity: 1, scale: 1,
+        duration: getDuration(el, 1.4),
+        ease: getEase(el, "power3.out"),
+        delay: getDelay(el) || 0.2,
       });
     },
   };
 
   // ════════════════════════════════════════════════════════
-  // 10. GSAP TIER — BUTTON INTERACTIONS
+  // 10. BUTTON INTERACTIONS
   // ════════════════════════════════════════════════════════
 
   var btnInteractions = {
+
     fill: function (el) {
       el.style.position = "relative";
       el.style.overflow = "hidden";
@@ -746,10 +988,10 @@
       var fill = document.createElement("span");
       fill.classList.add("hm-btn-fill");
       fill.style.cssText =
-        "position:absolute;inset:0;transform:scaleX(0);transform-origin:left;" +
-        "pointer-events:none;z-index:0;";
+        "position:absolute;inset:0;transform:scaleX(0);" +
+        "transform-origin:left;pointer-events:none;z-index:0;";
 
-      var color = attr(el, "fill-color", null);
+      var color = rawAttr(el, "fill-color", null);
       if (color) {
         fill.style.background = color;
       } else {
@@ -759,6 +1001,7 @@
 
       el.insertBefore(fill, el.firstChild);
 
+      // Keep existing content above the fill
       Array.from(el.children).forEach(function (c) {
         if (c !== fill) {
           c.style.position = "relative";
@@ -777,23 +1020,36 @@
     },
 
     magnetic: function (el) {
-      var strength = attr(el, "magnetic-strength", 0.3);
+      var strength = rawAttr(el, "magnetic-strength", 0.3);
+
+      // Disable on touch devices
       if ("ontouchstart" in window) return;
 
       addListener(el, "mousemove", function (e) {
         var r = el.getBoundingClientRect();
         var x = e.clientX - r.left - r.width / 2;
         var y = e.clientY - r.top - r.height / 2;
-        gsap.to(el, { x: x * strength, y: y * strength, duration: 0.2, ease: "power2.out" });
+        gsap.to(el, {
+          x: x * strength,
+          y: y * strength,
+          duration: 0.2,
+          ease: "power2.out",
+        });
       });
+
       addListener(el, "mouseleave", function () {
-        gsap.to(el, { x: 0, y: 0, duration: 0.4, ease: "elastic.out(1, 0.5)" });
+        gsap.to(el, {
+          x: 0, y: 0,
+          duration: 0.4,
+          ease: "elastic.out(1, 0.5)",
+        });
       });
     },
 
     "text-slide": function (el) {
       var textEl = el.querySelector("span");
 
+      // Auto-wrap text if no span exists
       if (!textEl) {
         textEl = document.createElement("span");
         textEl.textContent = el.textContent;
@@ -801,12 +1057,20 @@
         el.appendChild(textEl);
       }
 
+      // Lock height before hiding overflow
+      var rect = el.getBoundingClientRect();
+      el.style.height = rect.height + "px";
       el.style.overflow = "hidden";
       el.style.position = "relative";
+      el.style.display = "inline-flex";
+      el.style.alignItems = "center";
+      el.style.justifyContent = "center";
 
-      textEl.style.display = "inline-block";
+      textEl.style.display = "block";
       textEl.style.position = "relative";
       textEl.style.transition = "none";
+      textEl.style.width = "100%";
+      textEl.style.textAlign = "center";
 
       var clone = textEl.cloneNode(true);
       clone.classList.add("hm-btn-clone");
@@ -814,6 +1078,10 @@
       clone.style.left = "0";
       clone.style.top = "0";
       clone.style.width = "100%";
+      clone.style.height = "100%";
+      clone.style.display = "flex";
+      clone.style.alignItems = "center";
+      clone.style.justifyContent = "center";
       el.appendChild(clone);
 
       gsap.set(clone, { y: "100%" });
@@ -842,6 +1110,7 @@
     var btn = el.getAttribute("data-btn");
 
     if (type) {
+      // Reduced motion: show instantly
       if (state.reducedMotion && !shouldAnimate(el)) {
         el.style.opacity = "1";
         el.style.transform = "none";
@@ -849,13 +1118,16 @@
         return;
       }
 
+      // CSS tier elements were already handled — skip
       if (CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) return;
 
+      // GSAP scroll animations
       if (gsapScrollAnims[type] && state.gsapLoaded) {
         gsapScrollAnims[type](el);
         return;
       }
 
+      // GSAP load animations
       if (gsapLoadAnims[type] && state.gsapLoaded) {
         gsapLoadAnims[type](el);
         return;
@@ -864,7 +1136,9 @@
 
     if (btn && state.gsapLoaded) {
       if (state.reducedMotion && !shouldAnimate(el)) return;
-      if (btnInteractions[btn]) btnInteractions[btn](el);
+      if (btnInteractions[btn]) {
+        btnInteractions[btn](el);
+      }
     }
   }
 
@@ -889,9 +1163,16 @@
           needsGSAP = true;
         }
 
+        // New CSS-tier elements can be added to existing observer
         if (type && CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) {
           applyCSSOverrides(el);
-          state.observers.forEach(function (obs) { obs.observe(el); });
+          if (isInViewport(el)) {
+            el.classList.add("hm-visible");
+          } else {
+            state.observers.forEach(function (obs) {
+              obs.observe(el);
+            });
+          }
           state.processedEls.add(el);
         }
       });
@@ -907,11 +1188,14 @@
     }, 200);
 
     state.mutationObs = new MutationObserver(handleMutations);
-    state.mutationObs.observe(document.body, { childList: true, subtree: true });
+    state.mutationObs.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
   }
 
   // ════════════════════════════════════════════════════════
-  // 13. MAIN INITIALIZATION
+  // 13. INIT
   // ════════════════════════════════════════════════════════
 
   function init() {
@@ -931,21 +1215,32 @@
 
     allEls.forEach(function (el) {
       var type = el.getAttribute("data-animate");
-      if (CSS_TIER.indexOf(type) > -1) cssEls.push(el);
-      if (GSAP_TIER.indexOf(type) > -1) needsGSAP = true;
+      if (CSS_TIER.indexOf(type) > -1) {
+        cssEls.push(el);
+      }
+      if (GSAP_TIER.indexOf(type) > -1) {
+        needsGSAP = true;
+      }
     });
 
     if (btnEls.length > 0) needsGSAP = true;
 
-    // CSS tier starts immediately — zero wait
+    // CSS tier runs immediately — no dependencies
     initCSSTier(cssEls);
-    cssEls.forEach(function (el) { state.processedEls.add(el); });
+    cssEls.forEach(function (el) {
+      state.processedEls.add(el);
+    });
 
     if (needsGSAP) {
       loadGSAP().then(function () {
-        allEls.forEach(function (el) { processElement(el); });
-        btnEls.forEach(function (el) { processElement(el); });
+        allEls.forEach(function (el) {
+          processElement(el);
+        });
+        btnEls.forEach(function (el) {
+          processElement(el);
+        });
 
+        // Recalculate positions after all images/fonts load
         window.addEventListener("load", function () {
           ScrollTrigger.refresh();
         });
@@ -953,7 +1248,7 @@
         finishInit();
       });
     } else {
-      log("CSS-only mode — no GSAP needed for this page.");
+      log("CSS-only mode — no GSAP needed.");
       finishInit();
     }
   }
@@ -964,11 +1259,9 @@
     document.documentElement.classList.add("hm-ready");
     startCMSObserver();
 
-    log(
-      "Initialized. " +
-      document.querySelectorAll("[data-animate]").length + " animations, " +
-      document.querySelectorAll("[data-btn]").length + " button interactions."
-    );
+    var animCount = document.querySelectorAll("[data-animate]").length;
+    var btnCount = document.querySelectorAll("[data-btn]").length;
+    log("Ready. " + animCount + " animations, " + btnCount + " buttons.");
   }
 
   // ════════════════════════════════════════════════════════
@@ -981,7 +1274,9 @@
     });
     state.triggers = [];
 
-    state.observers.forEach(function (obs) { obs.disconnect(); });
+    state.observers.forEach(function (obs) {
+      obs.disconnect();
+    });
     state.observers = [];
 
     state.listeners.forEach(function (l) {
@@ -996,20 +1291,24 @@
 
     if (state.gsapLoaded && window.gsap) {
       gsap.killTweensOf("*");
-      ScrollTrigger.getAll().forEach(function (st) { st.kill(); });
+      ScrollTrigger.getAll().forEach(function (st) {
+        st.kill();
+      });
     }
 
     state.processedEls = new WeakSet();
     state.initialized = false;
 
-    document.documentElement.classList.remove("hm-loading", "hm-ready", "hm-fallback");
+    document.documentElement.classList.remove(
+      "hm-loading", "hm-ready", "hm-fallback"
+    );
 
-    log("Destroyed — all animations and listeners cleaned up.");
+    log("Destroyed.");
   }
 
   function refresh() {
     if (state.gsapLoaded) ScrollTrigger.refresh();
-    log("ScrollTrigger refreshed.");
+    log("Refreshed.");
   }
 
   function reinit() {
@@ -1017,7 +1316,6 @@
     init();
   }
 
-  // Expose public API
   window.HypeMotion = {
     version: VERSION,
     init: init,
@@ -1032,6 +1330,7 @@
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
+      // Two rAF frames to let Webflow finish its own init
       requestAnimationFrame(function () {
         requestAnimationFrame(init);
       });
@@ -1041,6 +1340,4 @@
       requestAnimationFrame(init);
     });
   }
-
 })();
-
