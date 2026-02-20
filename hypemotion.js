@@ -1,8 +1,31 @@
 (function () {
   "use strict";
 
-  var VERSION = "2.1.0";
+  var VERSION = "2.2.0";
   var LIB = "HypeMotion";
+
+  // ════════════════════════════════════════════════════════
+  // 0. INSTANT HIDE — runs synchronously at parse time
+  //    to prevent flash of visible content before init()
+  // ════════════════════════════════════════════════════════
+
+  (function earlyHide() {
+    // Avoid double-injection on reinit
+    if (document.getElementById("hm-early-hide")) return;
+    var s = document.createElement("style");
+    s.id = "hm-early-hide";
+    s.textContent = [
+      // Hide ALL animated elements instantly from first paint.
+      // Excludes parallax (no visibility change) and counter (shows "0").
+      "[data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
+      "  opacity: 0 !important; }",
+      // This stylesheet is removed once init() finishes, so it",
+      // won't interfere with animations.  If JS fails, the",
+      // FOIC fallback timeout forces everything visible anyway.",
+    ].join("\n");
+    // Insert into <head> or <html> — works even before <head> exists
+    (document.head || document.documentElement).appendChild(s);
+  })();
 
   // ════════════════════════════════════════════════════════
   // 1. CONFIGURATION
@@ -15,8 +38,6 @@
     distance: 40,
     stagger: 0.08,
     delay: 0,
-    // Trigger when the top of the element reaches 80% down
-    // the viewport — user clearly sees the element enter
     scrollStart: "top 80%",
     observerThreshold: 0.15,
     observerMargin: "0px 0px -20% 0px",
@@ -57,12 +78,8 @@
   // 3. UTILITIES
   // ════════════════════════════════════════════════════════
 
-  // Read a prefixed attribute: tries data-hm-X first, then data-X
-  // This avoids collision with Webflow's data-duration etc.
   function attr(el, name, fallback) {
-    // Prefer hm-prefixed version
     var v = el.getAttribute("data-hm-" + name);
-    // Fall back to non-prefixed only for HypeMotion-specific attrs
     if (v === null) {
       v = el.getAttribute("data-" + name);
     }
@@ -73,7 +90,6 @@
     return isNaN(n) ? v : n;
   }
 
-  // Read attributes that are always non-prefixed
   function rawAttr(el, name, fallback) {
     var v = el.getAttribute("data-" + name);
     if (v === null) return fallback;
@@ -104,7 +120,6 @@
     };
   }
 
-  // Check if element is currently in the viewport
   function isInViewport(el) {
     var rect = el.getBoundingClientRect();
     return (
@@ -126,7 +141,6 @@
   }
 
   function getDuration(el, fallback) {
-    // Only read hm-prefixed duration to avoid Webflow collision
     var v = el.getAttribute("data-hm-duration");
     if (v !== null) {
       var n = parseFloat(v);
@@ -183,7 +197,6 @@
     }
   }
 
-  // Build the from-values for directional fades
   function fadeVars(el, dir) {
     var d = getDistance(el);
     var base = {
@@ -199,8 +212,6 @@
     return base;
   }
 
-  // Set the initial hidden state on an element so there's
-  // no flash before ScrollTrigger takes over
   function setInitialState(el, dir) {
     var d = getDistance(el);
     var props = { opacity: 0 };
@@ -219,14 +230,15 @@
     var style = document.createElement("style");
     style.id = "hm-safety-css";
     style.textContent = [
-      // Only hide when JS is running
-      ".hm-loading [data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
-      "  opacity: 0; }",
-      // Force visible if something goes wrong
+      // Promote animated elements for GPU compositing during loading
+      "[data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
+      "  will-change: transform, opacity; }",
+      // Force visible if something goes wrong (timeout fallback)
       ".hm-fallback [data-animate] {",
       "  opacity: 1 !important;",
       "  transform: none !important;",
-      "  clip-path: none !important; }",
+      "  clip-path: none !important;",
+      "  will-change: auto !important; }",
     ].join("\n");
     document.head.appendChild(style);
   }
@@ -235,6 +247,9 @@
     setTimeout(function () {
       if (!state.initialized) {
         document.documentElement.classList.add("hm-fallback");
+        // Remove early-hide so fallback can force everything visible
+        var earlyHide = document.getElementById("hm-early-hide");
+        if (earlyHide) earlyHide.parentNode.removeChild(earlyHide);
         warn("Init timeout — fallback activated, content forced visible.");
       }
     }, CONFIG.foicTimeout);
@@ -264,6 +279,11 @@
     }
   }
 
+  // Clean up will-change after animation completes to free GPU memory
+  function clearWillChange(el) {
+    el.style.willChange = "auto";
+  }
+
   // ════════════════════════════════════════════════════════
   // 5. CSS TIER
   // ════════════════════════════════════════════════════════
@@ -274,58 +294,85 @@
     style.textContent = [
       // ── Keyframes ──
       "@keyframes hm-fade-up {",
-      "  from { opacity:0; transform:translateY(var(--hm-dist,40px)); }",
-      "  to { opacity:1; transform:translateY(0); } }",
+      "  from { opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
+      "  to { opacity:1; transform:translate3d(0,0,0); } }",
 
       "@keyframes hm-fade-down {",
-      "  from { opacity:0; transform:translateY(calc(var(--hm-dist,40px) * -1)); }",
-      "  to { opacity:1; transform:translateY(0); } }",
+      "  from { opacity:0; transform:translate3d(0,calc(var(--hm-dist,40px) * -1),0); }",
+      "  to { opacity:1; transform:translate3d(0,0,0); } }",
 
       "@keyframes hm-fade-left {",
-      "  from { opacity:0; transform:translateX(calc(var(--hm-dist,40px) * -1)); }",
-      "  to { opacity:1; transform:translateX(0); } }",
+      "  from { opacity:0; transform:translate3d(calc(var(--hm-dist,40px) * -1),0,0); }",
+      "  to { opacity:1; transform:translate3d(0,0,0); } }",
 
       "@keyframes hm-fade-right {",
-      "  from { opacity:0; transform:translateX(var(--hm-dist,40px)); }",
-      "  to { opacity:1; transform:translateX(0); } }",
+      "  from { opacity:0; transform:translate3d(var(--hm-dist,40px),0,0); }",
+      "  to { opacity:1; transform:translate3d(0,0,0); } }",
 
       "@keyframes hm-fade-in {",
       "  from { opacity:0; }",
       "  to { opacity:1; } }",
 
       "@keyframes hm-scale-in {",
-      "  from { opacity:0; transform:scale(0.9); }",
-      "  to { opacity:1; transform:scale(1); } }",
+      "  from { opacity:0; transform:scale3d(0.9,0.9,1); }",
+      "  to { opacity:1; transform:scale3d(1,1,1); } }",
 
       "@keyframes hm-reveal-up {",
       "  from { clip-path:inset(100% 0% 0% 0%); }",
       "  to { clip-path:inset(0% 0% 0% 0%); } }",
 
+      // ── Pre-animation: set initial state with transform to avoid jump ──
+      "[data-animate='fade-up']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
+      "[data-animate='fade-down']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; transform:translate3d(0,calc(var(--hm-dist,40px) * -1),0); }",
+      "[data-animate='fade-left']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; transform:translate3d(calc(var(--hm-dist,40px) * -1),0,0); }",
+      "[data-animate='fade-right']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; transform:translate3d(var(--hm-dist,40px),0,0); }",
+      "[data-animate='fade-in']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; }",
+      "[data-animate='scale-in']:not(.hm-in):not(.hm-visible) {",
+      "  opacity:0; transform:scale3d(0.9,0.9,1); }",
+      "[data-animate='reveal-up']:not(.hm-in):not(.hm-visible) {",
+      "  clip-path:inset(100% 0% 0% 0%); }",
+
       // ── Animation classes ──
       ".hm-in[data-animate='fade-up'] {",
+      "  will-change:transform,opacity;",
       "  animation:hm-fade-up var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-down'] {",
+      "  will-change:transform,opacity;",
       "  animation:hm-fade-down var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-left'] {",
+      "  will-change:transform,opacity;",
       "  animation:hm-fade-left var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-right'] {",
+      "  will-change:transform,opacity;",
       "  animation:hm-fade-right var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='fade-in'] {",
+      "  will-change:opacity;",
       "  animation:hm-fade-in var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='scale-in'] {",
+      "  will-change:transform,opacity;",
       "  animation:hm-scale-in var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
 
       ".hm-in[data-animate='reveal-up'] {",
+      "  will-change:clip-path;",
       "  animation:hm-reveal-up var(--hm-dur,1s) cubic-bezier(0.76,0,0.24,1) var(--hm-del,0s) both; }",
 
-      // ── Above fold: already visible elements animate immediately ──
+      // ── Above fold: already visible elements ──
       ".hm-visible[data-animate] {",
       "  opacity:1 !important; transform:none !important; clip-path:none !important; }",
+
+      // ── Clean up will-change after animation ends ──
+      ".hm-done[data-animate] {",
+      "  will-change:auto; }",
 
       // ── Reduced motion ──
       "@media (prefers-reduced-motion:reduce) {",
@@ -354,13 +401,22 @@
       function (entries) {
         entries.forEach(function (entry) {
           if (entry.isIntersecting) {
-            entry.target.classList.add("hm-in");
-            if (getOnce(entry.target)) {
-              observer.unobserve(entry.target);
+            var el = entry.target;
+            el.classList.add("hm-in");
+
+            // Clean up will-change after animation finishes
+            el.addEventListener("animationend", function onEnd() {
+              el.removeEventListener("animationend", onEnd);
+              el.classList.add("hm-done");
+            });
+
+            if (getOnce(el)) {
+              observer.unobserve(el);
             }
           } else {
             if (!getOnce(entry.target)) {
               entry.target.classList.remove("hm-in");
+              entry.target.classList.remove("hm-done");
             }
           }
         });
@@ -379,8 +435,6 @@
 
       applyCSSOverrides(el);
 
-      // If element is already in viewport on page load,
-      // show it immediately — don't animate on scroll
       if (isInViewport(el)) {
         el.classList.add("hm-visible");
       } else {
@@ -412,7 +466,6 @@
     if (state.gsapLoaded) return Promise.resolve();
     if (state.gsapLoading) return state.gsapPromise;
 
-    // GSAP already on the page (added manually or by Webflow)
     if (window.gsap && window.ScrollTrigger) {
       state.gsapLoaded = true;
       gsap.registerPlugin(ScrollTrigger);
@@ -420,7 +473,6 @@
       return Promise.resolve();
     }
 
-    // GSAP exists but ScrollTrigger doesn't
     if (window.gsap && !window.ScrollTrigger) {
       state.gsapLoading = true;
       state.gsapPromise = loadScript(CONFIG.gsapCDN + "/ScrollTrigger.min.js")
@@ -438,7 +490,6 @@
       return state.gsapPromise;
     }
 
-    // Load both
     state.gsapLoading = true;
     state.gsapPromise = loadScript(CONFIG.gsapCDN + "/gsap.min.js")
       .then(function () {
@@ -484,7 +535,6 @@
   function splitLines(el) {
     var hasBR = el.querySelector("br");
 
-    // Use <br> tags as explicit line boundaries
     if (hasBR) {
       var html = el.innerHTML;
       var parts = html.split(/<br\s*\/?>/gi);
@@ -498,6 +548,7 @@
         var inner = document.createElement("span");
         inner.innerHTML = trimmed;
         inner.style.display = "inline-block";
+        inner.style.willChange = "transform, opacity";
         inner.classList.add("hm-line");
         outer.appendChild(inner);
         el.appendChild(outer);
@@ -505,7 +556,6 @@
       return el.querySelectorAll(".hm-line");
     }
 
-    // Measure visual lines by word position
     var measuredWords = [];
     walkTextNodes(el, function (textNode) {
       var fragments = textNode.textContent.split(/(\s+)/);
@@ -525,7 +575,6 @@
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
-    // Group by visual line (same offsetTop)
     var lineGroups = [];
     var currentGroup = [];
     var currentTop = null;
@@ -542,7 +591,6 @@
     });
     if (currentGroup.length) lineGroups.push(currentGroup);
 
-    // Rebuild with line wrappers
     el.innerHTML = "";
     lineGroups.forEach(function (words) {
       var outer = document.createElement("span");
@@ -550,6 +598,7 @@
       outer.style.overflow = "hidden";
       var inner = document.createElement("span");
       inner.style.display = "inline-block";
+      inner.style.willChange = "transform, opacity";
       inner.classList.add("hm-line");
       words.forEach(function (w, i) {
         inner.appendChild(document.createTextNode(w.textContent));
@@ -575,6 +624,7 @@
           var s = document.createElement("span");
           s.textContent = p;
           s.style.display = "inline-block";
+          s.style.willChange = "transform, opacity";
           s.classList.add("hm-word");
           frag.appendChild(s);
         }
@@ -582,7 +632,6 @@
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
-    // Make existing inline elements animatable
     el.querySelectorAll("a, strong, em, span:not(.hm-word), b, i").forEach(
       function (node) {
         if (!node.classList.contains("hm-word")) {
@@ -617,6 +666,7 @@
           var s = document.createElement("span");
           s.textContent = c;
           s.style.display = "inline-block";
+          s.style.willChange = "transform, opacity";
           s.classList.add("hm-char");
           wordWrap.appendChild(s);
         }
@@ -643,11 +693,6 @@
 
   var gsapScrollAnims = {
 
-    // ── Directional fades ────────────────────────────────
-    // Each sets the initial hidden state explicitly with
-    // gsap.set() THEN creates the animation with fromTo()
-    // to prevent any flash of unstyled content.
-
     "fade-up": function (el) {
       setInitialState(el, "up");
       var t = gsap.to(el, {
@@ -655,7 +700,9 @@
         duration: getDuration(el, CONFIG.duration),
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -667,7 +714,9 @@
         duration: getDuration(el, CONFIG.duration),
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -679,7 +728,9 @@
         duration: getDuration(el, CONFIG.duration),
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -691,7 +742,9 @@
         duration: getDuration(el, CONFIG.duration),
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -704,6 +757,7 @@
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -715,7 +769,9 @@
         duration: getDuration(el, CONFIG.duration),
         ease: getEase(el, CONFIG.ease),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -728,6 +784,7 @@
         ease: getEase(el, "power4.inOut"),
         delay: getDelay(el),
         scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
       });
       trackTrigger(t);
     },
@@ -737,42 +794,57 @@
     "split-lines": function (el) {
       var parts = splitContent(el, "lines");
       if (!parts || !parts.length) return;
-      gsap.set(parts, { y: "110%", opacity: 0 });
-      gsap.to(parts, {
+      var partsArr = Array.prototype.slice.call(parts);
+      gsap.set(partsArr, { y: "110%", opacity: 0 });
+      gsap.to(partsArr, {
         y: "0%", opacity: 1,
         duration: getDuration(el, 0.9),
         ease: getEase(el, "power3.out"),
         stagger: getStagger(el, 0.12),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () {
+          partsArr.forEach(function (p) { clearWillChange(p); });
+        },
       });
     },
 
     "split-words": function (el) {
       var parts = splitContent(el, "words");
       if (!parts || !parts.length) return;
-      gsap.set(parts, { y: 20, opacity: 0 });
-      gsap.to(parts, {
+      var partsArr = Array.prototype.slice.call(parts);
+      gsap.set(partsArr, { y: 20, opacity: 0 });
+      gsap.to(partsArr, {
         y: 0, opacity: 1,
         duration: getDuration(el, 0.6),
         ease: getEase(el, "power2.out"),
         stagger: getStagger(el, 0.04),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () {
+          partsArr.forEach(function (p) { clearWillChange(p); });
+        },
       });
     },
 
     "split-chars": function (el) {
       var parts = splitContent(el, "chars");
       if (!parts || !parts.length) return;
-      gsap.set(parts, { y: 15, opacity: 0 });
-      gsap.to(parts, {
+      var partsArr = Array.prototype.slice.call(parts);
+      gsap.set(partsArr, { y: 15, opacity: 0 });
+      gsap.to(partsArr, {
         y: 0, opacity: 1,
         duration: getDuration(el, 0.5),
         ease: getEase(el, "power2.out"),
         stagger: getStagger(el, 0.02),
         delay: getDelay(el),
+
         scrollTrigger: scrollCfg(el),
+        onComplete: function () {
+          partsArr.forEach(function (p) { clearWillChange(p); });
+        },
       });
     },
 
@@ -829,28 +901,67 @@
       var children;
 
       if (selector) {
-        children = el.querySelectorAll(selector);
+        children = Array.prototype.slice.call(el.querySelectorAll(selector));
       } else {
-        children = el.children;
+        children = Array.prototype.slice.call(el.children);
       }
 
       if (!children || !children.length) return;
 
-      gsap.set(children, {
-        opacity: 0,
-        y: getDistance(el),
-      });
+      var dist = getDistance(el);
+      var dur = getDuration(el, CONFIG.duration);
+      var ease = getEase(el, CONFIG.ease);
+      var stag = getStagger(el, CONFIG.stagger);
+      var del = getDelay(el);
+      var once = getOnce(el);
+      var start = getScrollStart(el);
 
-      var t = gsap.to(children, {
-        opacity: 1,
-        y: 0,
-        duration: getDuration(el, CONFIG.duration),
-        ease: getEase(el, CONFIG.ease),
-        stagger: getStagger(el, CONFIG.stagger),
-        delay: getDelay(el),
-        scrollTrigger: scrollCfg(el),
+      // Hide all children immediately
+      gsap.set(children, { opacity: 0, y: dist });
+
+      // Group children into visual rows by their vertical position
+      // so each row staggers independently when it enters the viewport
+      var rows = [];
+      var currentRow = [];
+      var currentTop = null;
+      var tolerance = 10; // px — accounts for subpixel differences
+
+      children.forEach(function (child) {
+        var top = child.getBoundingClientRect().top;
+        if (currentTop === null || Math.abs(top - currentTop) < tolerance) {
+          currentRow.push(child);
+          if (currentTop === null) currentTop = top;
+        } else {
+          rows.push(currentRow);
+          currentRow = [child];
+          currentTop = top;
+        }
       });
-      trackTrigger(t);
+      if (currentRow.length) rows.push(currentRow);
+
+      // Each row gets its own ScrollTrigger — children within
+      // a row stagger sequentially when that row enters view
+      rows.forEach(function (row) {
+        var t = gsap.to(row, {
+          opacity: 1,
+          y: 0,
+          duration: dur,
+          ease: ease,
+          stagger: stag,
+          delay: del,
+          scrollTrigger: {
+            trigger: row[0],
+            start: start,
+            toggleActions: once
+              ? "play none none none"
+              : "play none none reverse",
+          },
+          onComplete: function () {
+            row.forEach(function (c) { clearWillChange(c); });
+          },
+        });
+        trackTrigger(t);
+      });
     },
 
     // ── Counter ──────────────────────────────────────────
@@ -926,7 +1037,6 @@
     parallax: function (el) {
       var speed = rawAttr(el, "parallax-speed", CONFIG.parallaxSpeed);
 
-      // Skip on mobile unless explicitly enabled
       if (window.innerWidth < 768 && !el.hasAttribute("data-parallax-mobile")) {
         return;
       }
@@ -936,6 +1046,7 @@
           return speed * 100;
         },
         ease: "none",
+
         scrollTrigger: {
           trigger: el,
           start: "top bottom",
@@ -954,13 +1065,18 @@
     "hero-text": function (el) {
       var parts = splitContent(el, "lines");
       if (!parts || !parts.length) return;
-      gsap.set(parts, { y: "110%", opacity: 0 });
-      gsap.to(parts, {
+      var partsArr = Array.prototype.slice.call(parts);
+      gsap.set(partsArr, { y: "110%", opacity: 0 });
+      gsap.to(partsArr, {
         y: "0%", opacity: 1,
         duration: getDuration(el, 1),
         ease: getEase(el, "power4.out"),
         stagger: getStagger(el, 0.15),
         delay: getDelay(el) || 0.3,
+
+        onComplete: function () {
+          partsArr.forEach(function (p) { clearWillChange(p); });
+        },
       });
     },
 
@@ -971,6 +1087,8 @@
         duration: getDuration(el, 1.4),
         ease: getEase(el, "power3.out"),
         delay: getDelay(el) || 0.2,
+
+        onComplete: function () { clearWillChange(el); },
       });
     },
   };
@@ -989,7 +1107,8 @@
       fill.classList.add("hm-btn-fill");
       fill.style.cssText =
         "position:absolute;inset:0;transform:scaleX(0);" +
-        "transform-origin:left;pointer-events:none;z-index:0;";
+        "transform-origin:left;pointer-events:none;z-index:0;" +
+        "will-change:transform;";
 
       var color = rawAttr(el, "fill-color", null);
       if (color) {
@@ -1001,7 +1120,6 @@
 
       el.insertBefore(fill, el.firstChild);
 
-      // Keep existing content above the fill
       Array.from(el.children).forEach(function (c) {
         if (c !== fill) {
           c.style.position = "relative";
@@ -1022,7 +1140,6 @@
     magnetic: function (el) {
       var strength = rawAttr(el, "magnetic-strength", 0.3);
 
-      // Disable on touch devices
       if ("ontouchstart" in window) return;
 
       addListener(el, "mousemove", function (e) {
@@ -1034,6 +1151,7 @@
           y: y * strength,
           duration: 0.2,
           ease: "power2.out",
+  
         });
       });
 
@@ -1042,6 +1160,7 @@
           x: 0, y: 0,
           duration: 0.4,
           ease: "elastic.out(1, 0.5)",
+  
         });
       });
     },
@@ -1049,7 +1168,6 @@
     "text-slide": function (el) {
       var textEl = el.querySelector("span");
 
-      // Auto-wrap text if no span exists
       if (!textEl) {
         textEl = document.createElement("span");
         textEl.textContent = el.textContent;
@@ -1057,7 +1175,6 @@
         el.appendChild(textEl);
       }
 
-      // Lock height before hiding overflow
       var rect = el.getBoundingClientRect();
       el.style.height = rect.height + "px";
       el.style.overflow = "hidden";
@@ -1071,6 +1188,7 @@
       textEl.style.transition = "none";
       textEl.style.width = "100%";
       textEl.style.textAlign = "center";
+      textEl.style.willChange = "transform";
 
       var clone = textEl.cloneNode(true);
       clone.classList.add("hm-btn-clone");
@@ -1082,6 +1200,7 @@
       clone.style.display = "flex";
       clone.style.alignItems = "center";
       clone.style.justifyContent = "center";
+      clone.style.willChange = "transform";
       el.appendChild(clone);
 
       gsap.set(clone, { y: "100%" });
@@ -1110,7 +1229,6 @@
     var btn = el.getAttribute("data-btn");
 
     if (type) {
-      // Reduced motion: show instantly
       if (state.reducedMotion && !shouldAnimate(el)) {
         el.style.opacity = "1";
         el.style.transform = "none";
@@ -1163,7 +1281,6 @@
           needsGSAP = true;
         }
 
-        // New CSS-tier elements can be added to existing observer
         if (type && CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) {
           applyCSSOverrides(el);
           if (isInViewport(el)) {
@@ -1208,8 +1325,12 @@
     document.documentElement.classList.add("hm-loading");
     injectCSSTier();
 
-    var allEls = document.querySelectorAll("[data-animate]");
-    var btnEls = document.querySelectorAll("[data-btn]");
+    var allEls = Array.prototype.slice.call(
+      document.querySelectorAll("[data-animate]")
+    );
+    var btnEls = Array.prototype.slice.call(
+      document.querySelectorAll("[data-btn]")
+    );
     var cssEls = [];
     var needsGSAP = false;
 
@@ -1225,7 +1346,7 @@
 
     if (btnEls.length > 0) needsGSAP = true;
 
-    // CSS tier runs immediately — no dependencies
+    // CSS tier runs immediately
     initCSSTier(cssEls);
     cssEls.forEach(function (el) {
       state.processedEls.add(el);
@@ -1233,12 +1354,27 @@
 
     if (needsGSAP) {
       loadGSAP().then(function () {
-        allEls.forEach(function (el) {
-          processElement(el);
-        });
-        btnEls.forEach(function (el) {
-          processElement(el);
-        });
+        // Process elements in batches via rAF to avoid
+        // blocking the main thread and causing jank
+        var gsapEls = allEls.concat(btnEls);
+        var BATCH = 10;
+        var idx = 0;
+
+        function processBatch() {
+          var end = Math.min(idx + BATCH, gsapEls.length);
+          for (var i = idx; i < end; i++) {
+            processElement(gsapEls[i]);
+          }
+          idx = end;
+          if (idx < gsapEls.length) {
+            requestAnimationFrame(processBatch);
+          } else {
+            // All elements processed, recalc scroll positions
+            ScrollTrigger.refresh();
+          }
+        }
+
+        requestAnimationFrame(processBatch);
 
         // Recalculate positions after all images/fonts load
         window.addEventListener("load", function () {
@@ -1257,6 +1393,13 @@
     state.initialized = true;
     document.documentElement.classList.remove("hm-loading");
     document.documentElement.classList.add("hm-ready");
+
+    // Remove the early-hide stylesheet — all elements are now either
+    // hidden by GSAP (gsap.set) or by the CSS pre-animation rules,
+    // so this blanket !important hide is no longer needed.
+    var earlyHide = document.getElementById("hm-early-hide");
+    if (earlyHide) earlyHide.parentNode.removeChild(earlyHide);
+
     startCMSObserver();
 
     var animCount = document.querySelectorAll("[data-animate]").length;
@@ -1330,7 +1473,6 @@
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
-      // Two rAF frames to let Webflow finish its own init
       requestAnimationFrame(function () {
         requestAnimationFrame(init);
       });
