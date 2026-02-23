@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "2.2.0";
+  var VERSION = "2.3.0";
   var LIB = "HypeMotion";
 
   // ════════════════════════════════════════════════════════
@@ -874,24 +874,17 @@
           break;
       }
 
-      gsap.set(el, { clipPath: clipFrom, scale: 1.15 });
+      gsap.set(el, { clipPath: clipFrom });
 
-      var tl = gsap.timeline({
-        scrollTrigger: scrollCfg(el),
-        delay: getDelay(el),
-      });
-
-      tl.to(el, {
+      var t = gsap.to(el, {
         clipPath: clipTo,
         duration: getDuration(el, 1),
         ease: getEase(el, "power4.inOut"),
-      }).to(
-        el,
-        { scale: 1, duration: 1.2, ease: "power2.out" },
-        "<0.3"
-      );
-
-      if (tl.scrollTrigger) state.triggers.push(tl.scrollTrigger);
+        delay: getDelay(el),
+        scrollTrigger: scrollCfg(el),
+        onComplete: function () { clearWillChange(el); },
+      });
+      trackTrigger(t);
     },
 
     // ── Stagger children ─────────────────────────────────
@@ -1369,7 +1362,9 @@
           if (idx < gsapEls.length) {
             requestAnimationFrame(processBatch);
           } else {
-            // All elements processed, recalc scroll positions
+            // All elements processed — safe to remove early-hide now
+            // that GSAP has set initial states on all elements
+            finishInit();
             ScrollTrigger.refresh();
           }
         }
@@ -1377,11 +1372,13 @@
         requestAnimationFrame(processBatch);
 
         // Recalculate positions after all images/fonts load
-        window.addEventListener("load", function () {
-          ScrollTrigger.refresh();
-        });
-
-        finishInit();
+        if (document.readyState === "complete") {
+          setTimeout(function () { ScrollTrigger.refresh(); }, 100);
+        } else {
+          window.addEventListener("load", function () {
+            ScrollTrigger.refresh();
+          });
+        }
       });
     } else {
       log("CSS-only mode — no GSAP needed.");
@@ -1482,4 +1479,17 @@
       requestAnimationFrame(init);
     });
   }
+
+  // Handle bfcache (back/forward navigation restoring a cached page)
+  window.addEventListener("pageshow", function (e) {
+    if (e.persisted) {
+      if (state.initialized && state.gsapLoaded && window.ScrollTrigger) {
+        ScrollTrigger.refresh();
+      } else if (!state.initialized) {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(init);
+        });
+      }
+    }
+  });
 })();
