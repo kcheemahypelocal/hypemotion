@@ -4,10 +4,10 @@
   var VERSION = "2.3.0";
   var LIB = "HypeMotion";
 
-  // ════════════════════════════════════════════════════════
-  // 0. INSTANT HIDE — runs synchronously at parse time
+  // 
+  // 0. INSTANT HIDE â€” runs synchronously at parse time
   //    to prevent flash of visible content before init()
-  // ════════════════════════════════════════════════════════
+  // 
 
   (function earlyHide() {
     // Avoid double-injection on reinit
@@ -23,13 +23,13 @@
       // won't interfere with animations.  If JS fails, the",
       // FOIC fallback timeout forces everything visible anyway.",
     ].join("\n");
-    // Insert into <head> or <html> — works even before <head> exists
+    // Insert into <head> or <html> â€” works even before <head> exists
     (document.head || document.documentElement).appendChild(s);
   })();
 
-  // ════════════════════════════════════════════════════════
+  // 
   // 1. CONFIGURATION
-  // ════════════════════════════════════════════════════════
+  // 
 
   var CONFIG = {
     duration: 0.8,
@@ -57,9 +57,9 @@
     "draw-line", "parallax", "hero-text", "hero-image",
   ];
 
-  // ════════════════════════════════════════════════════════
+  // 
   // 2. STATE
-  // ════════════════════════════════════════════════════════
+  // 
 
   var state = {
     initialized: false,
@@ -74,10 +74,9 @@
     processedEls: new WeakSet(),
   };
 
-  // ════════════════════════════════════════════════════════
-  // 3. UTILITIES
-  // ════════════════════════════════════════════════════════
-
+  //   // 3. UTILITIES
+  // 
+  
   function attr(el, name, fallback) {
     var v = el.getAttribute("data-hm-" + name);
     if (v === null) {
@@ -131,7 +130,7 @@
   }
 
   // ── GSAP helpers ───────────────────────────────────────
-
+  
   function getScrollStart(el) {
     return rawAttr(el, "scroll-start", CONFIG.scrollStart);
   }
@@ -222,10 +221,10 @@
     gsap.set(el, props);
   }
 
-  // ════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
   // 4. SAFETY SYSTEMS
   // ════════════════════════════════════════════════════════
-
+  
   function injectSafetyCSS() {
     var style = document.createElement("style");
     style.id = "hm-safety-css";
@@ -250,7 +249,7 @@
         // Remove early-hide so fallback can force everything visible
         var earlyHide = document.getElementById("hm-early-hide");
         if (earlyHide) earlyHide.parentNode.removeChild(earlyHide);
-        warn("Init timeout — fallback activated, content forced visible.");
+        warn("Init timeout â€” fallback activated, content forced visible.");
       }
     }, CONFIG.foicTimeout);
   }
@@ -284,15 +283,15 @@
     el.style.willChange = "auto";
   }
 
-  // ════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
   // 5. CSS TIER
   // ════════════════════════════════════════════════════════
-
+  
   function injectCSSTier() {
     var style = document.createElement("style");
     style.id = "hm-css-animations";
     style.textContent = [
-      // ── Keyframes ──
+      // â”€â”€ Keyframes â”€â”€
       "@keyframes hm-fade-up {",
       "  from { opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
       "  to { opacity:1; transform:translate3d(0,0,0); } }",
@@ -321,7 +320,7 @@
       "  from { clip-path:inset(100% 0% 0% 0%); }",
       "  to { clip-path:inset(0% 0% 0% 0%); } }",
 
-      // ── Pre-animation: set initial state with transform to avoid jump ──
+      // â”€â”€ Pre-animation: set initial state with transform to avoid jump â”€â”€
       "[data-animate='fade-up']:not(.hm-in):not(.hm-visible) {",
       "  opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
       "[data-animate='fade-down']:not(.hm-in):not(.hm-visible) {",
@@ -337,7 +336,7 @@
       "[data-animate='reveal-up']:not(.hm-in):not(.hm-visible) {",
       "  clip-path:inset(100% 0% 0% 0%); }",
 
-      // ── Animation classes ──
+      // â”€â”€ Animation classes â”€â”€
       ".hm-in[data-animate='fade-up'] {",
       "  will-change:transform,opacity;",
       "  animation:hm-fade-up var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
@@ -366,15 +365,15 @@
       "  will-change:clip-path;",
       "  animation:hm-reveal-up var(--hm-dur,1s) cubic-bezier(0.76,0,0.24,1) var(--hm-del,0s) both; }",
 
-      // ── Above fold: already visible elements ──
+      // â”€â”€ Above fold: already visible elements â”€â”€
       ".hm-visible[data-animate] {",
       "  opacity:1 !important; transform:none !important; clip-path:none !important; }",
 
-      // ── Clean up will-change after animation ends ──
+      // â”€â”€ Clean up will-change after animation ends â”€â”€
       ".hm-done[data-animate] {",
       "  will-change:auto; }",
 
-      // ── Reduced motion ──
+      // â”€â”€ Reduced motion â”€â”€
       "@media (prefers-reduced-motion:reduce) {",
       "  [data-animate]:not([data-motion='essential']) {",
       "    animation-duration:0.01ms !important;",
@@ -445,10 +444,11 @@
     state.observers.push(observer);
   }
 
+
   // ════════════════════════════════════════════════════════
   // 6. GSAP LOADER
   // ════════════════════════════════════════════════════════
-
+  
   function loadScript(src) {
     return new Promise(function (resolve, reject) {
       var s = document.createElement("script");
@@ -510,10 +510,11 @@
     return state.gsapPromise;
   }
 
+
   // ════════════════════════════════════════════════════════
   // 7. TEXT SPLITTER
   // ════════════════════════════════════════════════════════
-
+  
   function splitContent(el, type) {
     el.setAttribute("aria-label", el.textContent);
 
@@ -533,23 +534,51 @@
   }
 
   function splitLines(el) {
-    var hasBR = el.querySelector("br");
+    // Detect top-level BRs so we can preserve user-authored line breaks.
+    // DOM-walking (instead of splitting innerHTML as a string) keeps
+    // nested inline tags intact and avoids fragmenting their structure.
+    var topLevelBRs = [];
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 1 && n.tagName === "BR") {
+        topLevelBRs.push(n);
+      }
+    }
 
-    if (hasBR) {
-      var html = el.innerHTML;
-      var parts = html.split(/<br\s*\/?>/gi);
-      el.innerHTML = "";
-      parts.forEach(function (part) {
-        var trimmed = part.trim();
-        if (!trimmed) return;
+    if (topLevelBRs.length) {
+      var lineGroups = [[]];
+      var childNodes = Array.prototype.slice.call(el.childNodes);
+      childNodes.forEach(function (node) {
+        if (node.nodeType === 1 && node.tagName === "BR") {
+          lineGroups.push([]);
+        } else {
+          lineGroups[lineGroups.length - 1].push(node);
+        }
+      });
+
+      while (el.firstChild) el.removeChild(el.firstChild);
+
+      lineGroups.forEach(function (lineNodes) {
+        var hasContent = lineNodes.some(function (n) {
+          return n.nodeType === 1 ||
+            (n.nodeType === 3 && n.textContent.trim());
+        });
+        if (!hasContent) return;
+
         var outer = document.createElement("span");
         outer.style.display = "block";
         outer.style.overflow = "hidden";
+        // Bottom padding prevents descender clipping (g, y, p, etc.);
+        // negative margin keeps visual layout unchanged.
+        outer.style.paddingBottom = "0.15em";
+        outer.style.marginBottom = "-0.15em";
         var inner = document.createElement("span");
-        inner.innerHTML = trimmed;
         inner.style.display = "inline-block";
         inner.style.willChange = "transform, opacity";
         inner.classList.add("hm-line");
+        lineNodes.forEach(function (n) {
+          inner.appendChild(n);
+        });
         outer.appendChild(inner);
         el.appendChild(outer);
       });
@@ -596,6 +625,8 @@
       var outer = document.createElement("span");
       outer.style.display = "block";
       outer.style.overflow = "hidden";
+      outer.style.paddingBottom = "0.15em";
+      outer.style.marginBottom = "-0.15em";
       var inner = document.createElement("span");
       inner.style.display = "inline-block";
       inner.style.willChange = "transform, opacity";
@@ -687,10 +718,11 @@
     nodes.forEach(callback);
   }
 
+
   // ════════════════════════════════════════════════════════
   // 8. GSAP SCROLL ANIMATIONS
   // ════════════════════════════════════════════════════════
-
+  
   var gsapScrollAnims = {
 
     "fade-up": function (el) {
@@ -888,7 +920,7 @@
     },
 
     // ── Stagger children ─────────────────────────────────
-
+    
     "stagger-children": function (el) {
       var selector = rawAttr(el, "stagger-selector", null);
       var children;
@@ -917,7 +949,7 @@
       var rows = [];
       var currentRow = [];
       var currentTop = null;
-      var tolerance = 10; // px — accounts for subpixel differences
+      var tolerance = 10; // px â€” accounts for subpixel differences
 
       children.forEach(function (child) {
         var top = child.getBoundingClientRect().top;
@@ -932,7 +964,7 @@
       });
       if (currentRow.length) rows.push(currentRow);
 
-      // Each row gets its own ScrollTrigger — children within
+      // Each row gets its own ScrollTrigger â€” children within
       // a row stagger sequentially when that row enters view
       rows.forEach(function (row) {
         var t = gsap.to(row, {
@@ -1053,13 +1085,13 @@
   // ════════════════════════════════════════════════════════
   // 9. GSAP LOAD ANIMATIONS (Hero)
   // ════════════════════════════════════════════════════════
-
+  
   var gsapLoadAnims = {
     "hero-text": function (el) {
       var parts = splitContent(el, "lines");
       if (!parts || !parts.length) return;
       var partsArr = Array.prototype.slice.call(parts);
-      gsap.set(partsArr, { y: "110%", opacity: 0 });
+      gsap.set(partsArr, { y: "120%", opacity: 0 });
       gsap.to(partsArr, {
         y: "0%", opacity: 1,
         duration: getDuration(el, 1),
@@ -1086,10 +1118,11 @@
     },
   };
 
+
   // ════════════════════════════════════════════════════════
   // 10. BUTTON INTERACTIONS
   // ════════════════════════════════════════════════════════
-
+  
   var btnInteractions = {
 
     fill: function (el) {
@@ -1209,10 +1242,12 @@
     },
   };
 
+
   // ════════════════════════════════════════════════════════
   // 11. ELEMENT PROCESSING
   // ════════════════════════════════════════════════════════
 
+  
   function processElement(el) {
     if (state.processedEls.has(el)) return;
     state.processedEls.add(el);
@@ -1229,7 +1264,7 @@
         return;
       }
 
-      // CSS tier elements were already handled — skip
+      // CSS tier elements were already handled â€” skip
       if (CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) return;
 
       // GSAP scroll animations
@@ -1253,10 +1288,11 @@
     }
   }
 
+
   // ════════════════════════════════════════════════════════
   // 12. CMS DYNAMIC CONTENT OBSERVER
   // ════════════════════════════════════════════════════════
-
+  
   function startCMSObserver() {
     if (!window.MutationObserver) return;
 
@@ -1362,7 +1398,7 @@
           if (idx < gsapEls.length) {
             requestAnimationFrame(processBatch);
           } else {
-            // All elements processed — safe to remove early-hide now
+            // All elements processed â€” safe to remove early-hide now
             // that GSAP has set initial states on all elements
             finishInit();
             ScrollTrigger.refresh();
@@ -1381,7 +1417,7 @@
         }
       });
     } else {
-      log("CSS-only mode — no GSAP needed.");
+      log("CSS-only mode â€” no GSAP needed.");
       finishInit();
     }
   }
@@ -1391,7 +1427,7 @@
     document.documentElement.classList.remove("hm-loading");
     document.documentElement.classList.add("hm-ready");
 
-    // Remove the early-hide stylesheet — all elements are now either
+    // Remove the early-hide stylesheet â€” all elements are now either
     // hidden by GSAP (gsap.set) or by the CSS pre-animation rules,
     // so this blanket !important hide is no longer needed.
     var earlyHide = document.getElementById("hm-early-hide");
@@ -1407,7 +1443,7 @@
   // ════════════════════════════════════════════════════════
   // 14. PUBLIC API
   // ════════════════════════════════════════════════════════
-
+  
   function destroy() {
     state.triggers.forEach(function (st) {
       if (st && st.kill) st.kill();
@@ -1467,7 +1503,7 @@
   // ════════════════════════════════════════════════════════
   // 15. AUTO-INIT
   // ════════════════════════════════════════════════════════
-
+  
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
       requestAnimationFrame(function () {
