@@ -544,7 +544,7 @@
       lineHTMLs.forEach(function (lineHTML) {
         var probe = document.createElement("span");
         probe.innerHTML = lineHTML;
-        if (!probe.textContent.trim()) return;
+        var isEmpty = !probe.textContent.trim();
 
         var outer = document.createElement("span");
         outer.style.display = "block";
@@ -553,6 +553,15 @@
         // negative margin keeps visual layout unchanged.
         outer.style.paddingBottom = "0.15em";
         outer.style.marginBottom = "-0.15em";
+
+        // Empty segments (e.g. consecutive <br><br>) render as a blank
+        // spacer line so user-authored vertical gaps are preserved.
+        if (isEmpty) {
+          outer.innerHTML = "&nbsp;";
+          el.appendChild(outer);
+          return;
+        }
+
         var inner = document.createElement("span");
         inner.style.display = "inline-block";
         inner.style.willChange = "transform, opacity";
