@@ -534,36 +534,17 @@
   }
 
   function splitLines(el) {
-    // Detect top-level BRs so we can preserve user-authored line breaks.
-    // DOM-walking (instead of splitting innerHTML as a string) keeps
-    // nested inline tags intact and avoids fragmenting their structure.
-    var topLevelBRs = [];
-    for (var i = 0; i < el.childNodes.length; i++) {
-      var n = el.childNodes[i];
-      if (n.nodeType === 1 && n.tagName === "BR") {
-        topLevelBRs.push(n);
-      }
-    }
-
-    if (topLevelBRs.length) {
-      var lineGroups = [[]];
-      var childNodes = Array.prototype.slice.call(el.childNodes);
-      childNodes.forEach(function (node) {
-        if (node.nodeType === 1 && node.tagName === "BR") {
-          lineGroups.push([]);
-        } else {
-          lineGroups[lineGroups.length - 1].push(node);
-        }
-      });
-
-      while (el.firstChild) el.removeChild(el.firstChild);
-
-      lineGroups.forEach(function (lineNodes) {
-        var hasContent = lineNodes.some(function (n) {
-          return n.nodeType === 1 ||
-            (n.nodeType === 3 && n.textContent.trim());
-        });
-        if (!hasContent) return;
+    // Honor user-authored line breaks (<br>) at any depth — common in
+    // rich-text / Webflow setups where BRs may sit inside inline wrappers.
+    // Splitting on the innerHTML string lets the browser re-parse each
+    // line and gracefully balance any inline tags the BR happened to cross.
+    if (el.querySelector("br")) {
+      var lineHTMLs = el.innerHTML.split(/<br\s*\/?>/i);
+      el.innerHTML = "";
+      lineHTMLs.forEach(function (lineHTML) {
+        var probe = document.createElement("span");
+        probe.innerHTML = lineHTML;
+        if (!probe.textContent.trim()) return;
 
         var outer = document.createElement("span");
         outer.style.display = "block";
@@ -576,9 +557,7 @@
         inner.style.display = "inline-block";
         inner.style.willChange = "transform, opacity";
         inner.classList.add("hm-line");
-        lineNodes.forEach(function (n) {
-          inner.appendChild(n);
-        });
+        inner.innerHTML = lineHTML;
         outer.appendChild(inner);
         el.appendChild(outer);
       });
