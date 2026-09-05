@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "2.4.0";
+  var VERSION = "2.5.0";
   var LIB = "HypeMotion";
 
   // 
@@ -49,6 +49,13 @@
     fontTimeout: 1500,
     // Splits are re-measured after a width change (rotation, resize).
     resizeDebounce: 250,
+    // Retry gap when a re-measure lands while a split is still animating.
+    rebuildRetry: 400,
+    // Window in which stagger-children collects elements entering the
+    // viewport into one batch. Roughly "arrived together".
+    batchInterval: 0.1,
+    // Longest a single stagger cascade may run, however large the batch.
+    staggerMaxTotal: 1.2,
     gsapCDN: "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5",
   };
 
@@ -85,6 +92,11 @@
     originalHTML: new WeakMap(),
     resizeBound: false,
     lastWidth: 0,
+    rebuildRetry: null,
+
+    // stagger-children containers, kept so children added after init
+    // (CMS collections, "load more", filter re-renders) still animate.
+    staggers: [],
 
     // The single IntersectionObserver driving the CSS tier. Kept separate
     // from state.observers (which is teardown-only and mixes observer types).
@@ -593,9 +605,18 @@
   // Mobile browsers resize the viewport as the URL bar hides and shows.
   // Left alone, ScrollTrigger recalculates on every one of those, which
   // makes scroll-driven animations stutter and re-fire while scrolling.
+  var stConfigured = false;
+
   function configureScrollTrigger() {
-    if (window.ScrollTrigger && ScrollTrigger.config) {
-      ScrollTrigger.config({ ignoreMobileResize: true });
+    if (stConfigured || !window.ScrollTrigger || !ScrollTrigger.config) return;
+    stConfigured = true;
+
+    ScrollTrigger.config({ ignoreMobileResize: true });
+
+    // Row offsets for stagger-children are cached per refresh; a refresh is
+    // exactly when the layout may have moved underneath them.
+    if (ScrollTrigger.addEventListener) {
+      ScrollTrigger.addEventListener("refreshInit", function () { rowTick++; });
     }
   }
 
@@ -1137,13 +1158,20 @@
 
     markSelfMutation();
 
+    var deferred = false;
+
     state.splits.forEach(function (rec) {
       var html = state.originalHTML.get(rec.el);
       if (html == null || !rec.el.isConnected) return;
 
-      // Mid-flight: restarting would visibly jump. It will be re-measured on
-      // the next change, and the current layout is still the one it began in.
-      if (rec.tween && rec.tween.isActive()) return;
+      // Mid-flight: restarting would visibly jump, so let it finish and come
+      // back for it. Skipping outright would strand the element on line boxes
+      // measured for the old width until some later resize happened to
+      // arrive — which, on a rotation that lands mid-animation, is never.
+      if (rec.tween && rec.tween.isActive()) {
+        deferred = true;
+        return;
+      }
 
       if (rec.tween) {
         untrackTrigger(rec.tween);
@@ -1158,6 +1186,12 @@
     });
 
     ScrollTrigger.refresh();
+
+    // Terminates: it only re-arms while a tween is running, and tweens end.
+    if (deferred) {
+      clearTimeout(state.rebuildRetry);
+      state.rebuildRetry = setTimeout(rebuildSplits, CONFIG.rebuildRetry);
+    }
   }
 
   function ensureResizeWatcher() {
@@ -1172,6 +1206,227 @@
       state.lastWidth = window.innerWidth;
       rebuildSplits();
     }, CONFIG.resizeDebounce));
+  }
+
+  // ════════════════════════════════════════════════════════
+  // 7c. STAGGER CHILDREN
+  // ════════════════════════════════════════════════════════
+
+  // Built on ScrollTrigger.batch, which groups elements by WHEN THEY ENTER
+  // the viewport rather than by where they sit.
+  //
+  // This replaces hand-rolled row detection that grouped children by their
+  // measured top in DOM order. That approach broke in ordinary layouts:
+  //
+  //   - align-items other than stretch/start gives items in one visual row
+  //     different tops, so each became its own "row" and stagger — which
+  //     needs more than one target to do anything — silently did nothing.
+  //   - Vertical lists hit the same thing: every item its own group.
+  //   - Rows were measured once and baked in, so after a resize rewrapped a
+  //     3-column grid into 1 column the groups were still the old triples.
+  //   - A container that was display:none at init measured every child at
+  //     top 0, collapsing them into a single group whose trigger was the
+  //     first child. Everything then fired at once when that child scrolled
+  //     into view, so lower rows were already finished by the time they were
+  //     on screen — the "it just doesn't animate" case.
+  //
+  // Batching sidesteps all of it: one trigger per child, grouped at runtime.
+
+  // Per-child triggers have one artifact: children in the same visual row can
+  // sit at different heights (align-items:center, or simply shorter content),
+  // so a lower one crosses the trigger line later. Stop scrolling in that gap
+  // and a fully visible row has an un-animated card sitting in it.
+  //
+  // Fixed by offsetting each child's start by how far it sits below the top
+  // of its own row, so one row shares one trigger line. The offset is
+  // returned from a function, which ScrollTrigger re-evaluates on every
+  // refresh — so it re-derives itself after a resize instead of going stale.
+  var rowTick = 0;
+  var rowCache = new WeakMap();
+
+  // offsetTop/offsetHeight rather than getBoundingClientRect: they ignore
+  // transforms, so rows measure correctly even mid-animation.
+  function computeRowOffsets(children) {
+    var boxes = [];
+    children.forEach(function (c) {
+      var h = c.offsetHeight;
+      if (h > 0) boxes.push({ el: c, top: c.offsetTop, bottom: c.offsetTop + h });
+    });
+    boxes.sort(function (a, b) { return a.top - b.top; });
+
+    var offsets = new WeakMap();
+    var i = 0;
+    while (i < boxes.length) {
+      var rowTop = boxes[i].top;          // sorted, so this is the row's top
+      var rowBottom = boxes[i].bottom;
+      var row = [boxes[i]];
+      var j = i + 1;
+
+      // Same row if the vertical bands overlap by at least half the height
+      // of the shorter box. Tolerates centred and unequal-height items
+      // without assuming DOM order matches visual order.
+      while (j < boxes.length) {
+        var b = boxes[j];
+        var overlap = Math.min(rowBottom, b.bottom) - Math.max(rowTop, b.top);
+        var shorter = Math.min(b.bottom - b.top, rowBottom - rowTop);
+        if (overlap < shorter * 0.5) break;
+        row.push(b);
+        rowBottom = Math.max(rowBottom, b.bottom);
+        j++;
+      }
+
+      row.forEach(function (b) { offsets.set(b.el, b.top - rowTop); });
+      i = j;
+    }
+    return offsets;
+  }
+
+  function rowOffsetFor(container, child) {
+    var entry = rowCache.get(container);
+    if (!entry || entry.tick !== rowTick) {
+      entry = { tick: rowTick, offsets: computeRowOffsets(staggerTargets(container)) };
+      rowCache.set(container, entry);
+    }
+    return entry.offsets.get(child) || 0;
+  }
+
+  // Shifts a ScrollTrigger start string earlier by `off` pixels:
+  //   ("top 80%", 90)      -> "top-=90 80%"
+  //   ("top+=120 80%", 90) -> "top+=30 80%"
+  // Anything it cannot parse is passed through untouched.
+  function alignedStart(start, off) {
+    if (!off) return start;
+    var parts = String(start).trim().split(/\s+/);
+    var m = parts[0].match(/^([a-z]+)(?:([+-]=)(-?[\d.]+))?$/i);
+    if (!m) return start;
+
+    var existing = m[2] ? (m[2] === "-=" ? -parseFloat(m[3]) : parseFloat(m[3])) : 0;
+    var total = existing - off;
+    var head = m[1] + (total ? (total < 0 ? "-=" : "+=") + Math.abs(total) : "");
+    return [head].concat(parts.slice(1)).join(" ");
+  }
+
+  function staggerTargets(el) {
+    var selector = rawAttr(el, "stagger-selector", null);
+    if (selector && typeof selector === "string") {
+      return Array.prototype.slice.call(el.querySelectorAll(selector));
+    }
+    return Array.prototype.slice.call(el.children);
+  }
+
+  // Small batches keep their per-item rhythm. Past a point, adding another
+  // interval per item makes the tail of a large batch arrive long after the
+  // viewer has moved on, so spread the whole batch over a fixed window.
+  function staggerFor(count, each) {
+    return count * each > CONFIG.staggerMaxTotal
+      ? { amount: CONFIG.staggerMaxTotal }
+      : each;
+  }
+
+  function runStagger(el) {
+    var children = staggerTargets(el);
+    if (!children.length) {
+      warn(
+        "stagger-children: nothing to animate in " +
+        (el.className || el.tagName) +
+        (rawAttr(el, "stagger-selector", null)
+          ? " (data-stagger-selector matched no elements)" : "")
+      );
+      return;
+    }
+
+    var o = {
+      dist: getDistance(el),
+      dur: getDuration(el, CONFIG.duration),
+      ease: getEase(el, CONFIG.ease),
+      stag: getStagger(el, CONFIG.stagger),
+      del: getDelay(el),
+      once: getOnce(el),
+      start: getScrollStart(el),
+      batchMax: parseFloat(el.getAttribute("data-hm-batch-max")) || 0,
+    };
+
+    var rec = { el: el, opts: o, seen: new WeakSet() };
+    state.staggers.push(rec);
+
+    attachStagger(rec, children);
+  }
+
+  // Hides a set of children and gives them their own batch of triggers.
+  // Called for the initial children and again for any added later by a CMS
+  // collection, a "load more" button, or a filter re-render.
+  function attachStagger(rec, children) {
+    var o = rec.opts;
+    var fresh = children.filter(function (c) { return !rec.seen.has(c); });
+    if (!fresh.length) return;
+    fresh.forEach(function (c) { rec.seen.add(c); });
+
+    // Safe to hide even while the container is display:none — nothing is on
+    // screen — and doing it now avoids a flash when it is revealed.
+    gsap.set(fresh, { opacity: 0, y: o.dist });
+
+    function create() {
+      var vars = {
+        interval: CONFIG.batchInterval,
+        // Re-evaluated by ScrollTrigger on every refresh, so row alignment
+        // follows the layout instead of being measured once and baked in.
+        start: function (self) {
+          return alignedStart(o.start, rowOffsetFor(rec.el, self.trigger));
+        },
+        once: o.once,
+        onEnter: function (batch) {
+          setWillChange(batch, "transform, opacity");
+          gsap.to(batch, {
+            opacity: 1,
+            y: 0,
+            duration: o.dur,
+            ease: o.ease,
+            delay: o.del,
+            stagger: staggerFor(batch.length, o.stag),
+            overwrite: true,
+            onComplete: function () { setWillChange(batch, "auto"); },
+          });
+        },
+      };
+
+      if (o.batchMax) vars.batchMax = o.batchMax;
+
+      if (!o.once) {
+        vars.onLeaveBack = function (batch) {
+          gsap.to(batch, {
+            opacity: 0,
+            y: o.dist,
+            duration: o.dur * 0.6,
+            ease: o.ease,
+            stagger: staggerFor(batch.length, o.stag),
+            overwrite: true,
+          });
+        };
+      }
+
+      ScrollTrigger.batch(fresh, vars).forEach(function (t) {
+        state.triggers.push(t);
+      });
+    }
+
+    if (isMeasurable(rec.el)) {
+      create();
+    } else if (!deferUntilMeasurable(rec.el, create)) {
+      // Nothing will tell us when this gains layout, so never leave it
+      // hidden — an un-animated grid beats an invisible one.
+      gsap.set(fresh, { opacity: 1, y: 0 });
+    }
+  }
+
+  // Picks up children added after init. Webflow collection lists, "load
+  // more" buttons and filter re-renders all append into a container that was
+  // already processed, so the container itself is never revisited.
+  function refreshStaggers() {
+    if (!state.gsapLoaded) return;
+    state.staggers.forEach(function (rec) {
+      if (!rec.el.isConnected) return;
+      attachStagger(rec, staggerTargets(rec.el));
+    });
   }
 
   // ════════════════════════════════════════════════════════
@@ -1335,74 +1590,7 @@
 
     // ── Stagger children ─────────────────────────────────
     
-    "stagger-children": function (el) {
-      var selector = rawAttr(el, "stagger-selector", null);
-      var children;
-
-      if (selector) {
-        children = Array.prototype.slice.call(el.querySelectorAll(selector));
-      } else {
-        children = Array.prototype.slice.call(el.children);
-      }
-
-      if (!children || !children.length) return;
-
-      var dist = getDistance(el);
-      var dur = getDuration(el, CONFIG.duration);
-      var ease = getEase(el, CONFIG.ease);
-      var stag = getStagger(el, CONFIG.stagger);
-      var del = getDelay(el);
-      var once = getOnce(el);
-      var start = getScrollStart(el);
-
-      // Hide all children immediately
-      setWillChange(children, "transform, opacity");
-      gsap.set(children, { opacity: 0, y: dist });
-
-      // Group children into visual rows by their vertical position
-      // so each row staggers independently when it enters the viewport
-      var rows = [];
-      var currentRow = [];
-      var currentTop = null;
-      var tolerance = 10; // px — accounts for subpixel differences
-
-      children.forEach(function (child) {
-        var top = child.getBoundingClientRect().top;
-        if (currentTop === null || Math.abs(top - currentTop) < tolerance) {
-          currentRow.push(child);
-          if (currentTop === null) currentTop = top;
-        } else {
-          rows.push(currentRow);
-          currentRow = [child];
-          currentTop = top;
-        }
-      });
-      if (currentRow.length) rows.push(currentRow);
-
-      // Each row gets its own ScrollTrigger — children within
-      // a row stagger sequentially when that row enters view
-      rows.forEach(function (row) {
-        var t = gsap.to(row, {
-          opacity: 1,
-          y: 0,
-          duration: dur,
-          ease: ease,
-          stagger: stag,
-          delay: del,
-          scrollTrigger: {
-            trigger: row[0],
-            start: start,
-            toggleActions: once
-              ? "play none none none"
-              : "play none none reverse",
-          },
-          onComplete: function () {
-            row.forEach(function (c) { clearWillChange(c); });
-          },
-        });
-        trackTrigger(t);
-      });
-    },
+    "stagger-children": runStagger,
 
     // ── Counter ──────────────────────────────────────────
 
@@ -1739,6 +1927,10 @@
         }
       });
 
+      // Children appended into an existing stagger-children container never
+      // reach the loop above: the container itself was processed long ago.
+      if (state.staggers.length) refreshStaggers();
+
       if (needsGSAP) {
         loadGSAP().then(function () {
           newEls.forEach(function (el) {
@@ -1746,6 +1938,8 @@
           });
           ScrollTrigger.refresh();
         });
+      } else if (state.staggers.length && state.gsapLoaded) {
+        ScrollTrigger.refresh();
       }
     }, 200);
 
@@ -1880,6 +2074,10 @@
       clearTimeout(state.foicTimer);
       state.foicTimer = null;
     }
+    if (state.rebuildRetry) {
+      clearTimeout(state.rebuildRetry);
+      state.rebuildRetry = null;
+    }
 
     state.triggers.forEach(function (st) {
       if (st && st.kill) st.kill();
@@ -1926,6 +2124,15 @@
     state.splits = [];
     state.originalHTML = new WeakMap();
 
+    // Children were left mid-animation at whatever opacity/transform the
+    // batch had reached; clear it so nothing stays half-faded.
+    state.staggers.forEach(function (rec) {
+      if (!rec.el.isConnected) return;
+      var kids = staggerTargets(rec.el);
+      if (window.gsap) gsap.set(kids, { clearProps: "opacity,transform,willChange" });
+    });
+    state.staggers = [];
+
     // Remove injected stylesheets, or a reinit stacks duplicates and the
     // pre-animation rules keep hiding content that nothing will reveal.
     state.styles.forEach(function (s) {
@@ -1959,6 +2166,7 @@
   // new layout, not just repositioned.
   function refresh() {
     if (state.gsapLoaded) {
+      refreshStaggers();
       if (state.splits.length) rebuildSplits();   // refreshes ScrollTrigger
       else ScrollTrigger.refresh();
     }
