@@ -1,11 +1,11 @@
 (function () {
   "use strict";
 
-  var VERSION = "2.3.0";
+  var VERSION = "2.4.0";
   var LIB = "HypeMotion";
 
   // 
-  // 0. INSTANT HIDE â€” runs synchronously at parse time
+  // 0. INSTANT HIDE — runs synchronously at parse time
   //    to prevent flash of visible content before init()
   // 
 
@@ -23,7 +23,7 @@
       // won't interfere with animations.  If JS fails, the",
       // FOIC fallback timeout forces everything visible anyway.",
     ].join("\n");
-    // Insert into <head> or <html> â€” works even before <head> exists
+    // Insert into <head> or <html> — works even before <head> exists
     (document.head || document.documentElement).appendChild(s);
   })();
 
@@ -44,6 +44,11 @@
     once: true,
     parallaxSpeed: 0.2,
     foicTimeout: 4000,
+    // Max time to wait for webfonts before measuring text splits.
+    // Measuring in a fallback font bakes in the wrong line breaks.
+    fontTimeout: 1500,
+    // Splits are re-measured after a width change (rotation, resize).
+    resizeDebounce: 250,
     gsapCDN: "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5",
   };
 
@@ -72,6 +77,26 @@
     listeners: [],
     mutationObs: null,
     processedEls: new WeakSet(),
+
+    // Split-text bookkeeping. Splits destroy and rebuild the DOM of the
+    // element they run on, so we keep the pristine markup to restore from
+    // and re-measure against whenever layout changes underneath us.
+    splits: [],
+    originalHTML: new WeakMap(),
+    resizeBound: false,
+    lastWidth: 0,
+
+    // The single IntersectionObserver driving the CSS tier. Kept separate
+    // from state.observers (which is teardown-only and mixes observer types).
+    cssObserver: null,
+
+    // Teardown handles.
+    styles: [],
+    foicTimer: null,
+
+    // Timestamp of the last DOM mutation we caused ourselves, so the CMS
+    // observer doesn't chase its own tail when a split rewrites innerHTML.
+    lastSelfMutation: 0,
   };
 
   //   // 3. UTILITIES
@@ -127,6 +152,75 @@
       rect.left < window.innerWidth &&
       rect.right > 0
     );
+  }
+
+  // How an element should start out, decided once at init.
+  //
+  //   "played"  - already scrolled past. Show it immediately: waiting for an
+  //               observer that will never fire leaves it blank forever on a
+  //               reload that restores scroll position.
+  //   "enter"   - inside (or near) the viewport. Animate it now, so the CSS
+  //               tier matches the GSAP tier, whose already-passed
+  //               ScrollTriggers fire on the first refresh.
+  //   "observe" - below the fold. Hand it to the observer.
+  //
+  // The 0.8 threshold mirrors CONFIG.observerMargin ("0px 0px -20% 0px"), so
+  // an element never lands in "enter" that the observer would have ignored.
+  function initialPosition(el) {
+    var rect = el.getBoundingClientRect();
+    if (rect.bottom <= 0) return "played";
+    if (rect.top < window.innerHeight * 0.8) return "enter";
+    return "observe";
+  }
+
+  // Text splitting depends on getBoundingClientRect(), which returns zeroes
+  // for anything display:none or not yet laid out (closed tabs, unopened
+  // sliders, lazy sections). Splitting there collapses every word onto one
+  // "line" and wrecks the layout, so we defer instead.
+  function isMeasurable(el) {
+    if (!el || !el.isConnected) return false;
+    if (el.getBoundingClientRect().width < 1) return false;
+    if (!el.offsetParent) {
+      // offsetParent is legitimately null for position:fixed subtrees.
+      if (window.getComputedStyle(el).position !== "fixed") return false;
+    }
+    return true;
+  }
+
+  // Words on the same visual line share a top within sub-pixel noise, but
+  // superscripts and mixed font sizes drift a few px. Half a line-height
+  // separates "same line" from "next line" at any type size.
+  function lineTolerance(el) {
+    var cs = window.getComputedStyle(el);
+    var lh = parseFloat(cs.lineHeight);
+    if (isNaN(lh)) lh = (parseFloat(cs.fontSize) || 16) * 1.2;
+    return Math.max(4, lh * 0.5);
+  }
+
+  // Resolves once webfonts have settled, or after CONFIG.fontTimeout if they
+  // stall. Never rejects: a font that fails to load must not block animation.
+  function whenFontsReady(cb) {
+    var done = false;
+    function go() {
+      if (done) return;
+      done = true;
+      cb();
+    }
+    if (!document.fonts || !document.fonts.ready) return go();
+    var t = setTimeout(go, CONFIG.fontTimeout);
+    document.fonts.ready
+      .then(function () { clearTimeout(t); go(); })
+      .catch(function () { clearTimeout(t); go(); });
+  }
+
+  function setWillChange(els, value) {
+    for (var i = 0; i < els.length; i++) {
+      els[i].style.willChange = value;
+    }
+  }
+
+  function markSelfMutation() {
+    state.lastSelfMutation = Date.now();
   }
 
   // ── GSAP helpers ───────────────────────────────────────
@@ -196,6 +290,14 @@
     }
   }
 
+  // Splits are torn down and rebuilt on every width change; without this the
+  // triggers array would grow by one entry per split per resize.
+  function untrackTrigger(tween) {
+    if (!tween || !tween.scrollTrigger) return;
+    var i = state.triggers.indexOf(tween.scrollTrigger);
+    if (i > -1) state.triggers.splice(i, 1);
+  }
+
   function fadeVars(el, dir) {
     var d = getDistance(el);
     var base = {
@@ -218,6 +320,7 @@
     else if (dir === "down") { props.y = -d; }
     else if (dir === "left") { props.x = -d; }
     else if (dir === "right") { props.x = d; }
+    primeWillChange(el);
     gsap.set(el, props);
   }
 
@@ -229,8 +332,14 @@
     var style = document.createElement("style");
     style.id = "hm-safety-css";
     style.textContent = [
-      // Promote animated elements for GPU compositing during loading
-      "[data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
+      // Promote animated elements for GPU compositing during loading.
+      //
+      // Scoped to .hm-loading deliberately. A permanent will-change keeps
+      // every animated element on its own compositing layer for the life of
+      // the page, which drops text off subpixel antialiasing and holds GPU
+      // memory that is never reclaimed. Past this phase each animation
+      // primes and releases will-change around its own tween.
+      ".hm-loading [data-animate]:not([data-animate='parallax']):not([data-animate='counter']) {",
       "  will-change: transform, opacity; }",
       // Force visible if something goes wrong (timeout fallback)
       ".hm-fallback [data-animate] {",
@@ -240,16 +349,17 @@
       "  will-change: auto !important; }",
     ].join("\n");
     document.head.appendChild(style);
+    state.styles.push(style);
   }
 
   function enableFOICFallback() {
-    setTimeout(function () {
+    state.foicTimer = setTimeout(function () {
       if (!state.initialized) {
         document.documentElement.classList.add("hm-fallback");
         // Remove early-hide so fallback can force everything visible
         var earlyHide = document.getElementById("hm-early-hide");
         if (earlyHide) earlyHide.parentNode.removeChild(earlyHide);
-        warn("Init timeout â€” fallback activated, content forced visible.");
+        warn("Init timeout — fallback activated, content forced visible.");
       }
     }, CONFIG.foicTimeout);
   }
@@ -278,6 +388,12 @@
     }
   }
 
+  // Hint the compositor just before a tween starts. Paired with
+  // clearWillChange so the promotion lasts only as long as the animation.
+  function primeWillChange(el, props) {
+    el.style.willChange = props || "transform, opacity";
+  }
+
   // Clean up will-change after animation completes to free GPU memory
   function clearWillChange(el) {
     el.style.willChange = "auto";
@@ -291,7 +407,7 @@
     var style = document.createElement("style");
     style.id = "hm-css-animations";
     style.textContent = [
-      // â”€â”€ Keyframes â”€â”€
+      // ── Keyframes ──
       "@keyframes hm-fade-up {",
       "  from { opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
       "  to { opacity:1; transform:translate3d(0,0,0); } }",
@@ -320,7 +436,7 @@
       "  from { clip-path:inset(100% 0% 0% 0%); }",
       "  to { clip-path:inset(0% 0% 0% 0%); } }",
 
-      // â”€â”€ Pre-animation: set initial state with transform to avoid jump â”€â”€
+      // ── Pre-animation: set initial state with transform to avoid jump ──
       "[data-animate='fade-up']:not(.hm-in):not(.hm-visible) {",
       "  opacity:0; transform:translate3d(0,var(--hm-dist,40px),0); }",
       "[data-animate='fade-down']:not(.hm-in):not(.hm-visible) {",
@@ -336,7 +452,7 @@
       "[data-animate='reveal-up']:not(.hm-in):not(.hm-visible) {",
       "  clip-path:inset(100% 0% 0% 0%); }",
 
-      // â”€â”€ Animation classes â”€â”€
+      // ── Animation classes ──
       ".hm-in[data-animate='fade-up'] {",
       "  will-change:transform,opacity;",
       "  animation:hm-fade-up var(--hm-dur,0.8s) var(--hm-ease,cubic-bezier(0.33,1,0.68,1)) var(--hm-del,0s) both; }",
@@ -365,15 +481,15 @@
       "  will-change:clip-path;",
       "  animation:hm-reveal-up var(--hm-dur,1s) cubic-bezier(0.76,0,0.24,1) var(--hm-del,0s) both; }",
 
-      // â”€â”€ Above fold: already visible elements â”€â”€
+      // ── Above fold: already visible elements ──
       ".hm-visible[data-animate] {",
       "  opacity:1 !important; transform:none !important; clip-path:none !important; }",
 
-      // â”€â”€ Clean up will-change after animation ends â”€â”€
+      // ── Clean up will-change after animation ends ──
       ".hm-done[data-animate] {",
       "  will-change:auto; }",
 
-      // â”€â”€ Reduced motion â”€â”€
+      // ── Reduced motion ──
       "@media (prefers-reduced-motion:reduce) {",
       "  [data-animate]:not([data-motion='essential']) {",
       "    animation-duration:0.01ms !important;",
@@ -382,6 +498,7 @@
       "    opacity:1; transform:none; clip-path:none; } }",
     ].join("\n");
     document.head.appendChild(style);
+    state.styles.push(style);
   }
 
   function applyCSSOverrides(el) {
@@ -393,6 +510,15 @@
     if (dist) { el.style.setProperty("--hm-dist", dist + "px"); }
   }
 
+  // Starts a CSS-tier animation and releases will-change once it ends.
+  function enterCSS(el) {
+    el.classList.add("hm-in");
+    el.addEventListener("animationend", function onEnd() {
+      el.removeEventListener("animationend", onEnd);
+      el.classList.add("hm-done");
+    });
+  }
+
   function initCSSTier(elements) {
     if (!elements.length) return;
 
@@ -401,13 +527,7 @@
         entries.forEach(function (entry) {
           if (entry.isIntersecting) {
             var el = entry.target;
-            el.classList.add("hm-in");
-
-            // Clean up will-change after animation finishes
-            el.addEventListener("animationend", function onEnd() {
-              el.removeEventListener("animationend", onEnd);
-              el.classList.add("hm-done");
-            });
+            enterCSS(el);
 
             if (getOnce(el)) {
               observer.unobserve(el);
@@ -434,13 +554,21 @@
 
       applyCSSOverrides(el);
 
-      if (isInViewport(el)) {
+      var pos = initialPosition(el);
+      if (pos === "played") {
+        // Above the viewport already. Show it outright — its observer would
+        // never fire, leaving it invisible for the rest of the session.
         el.classList.add("hm-visible");
+      } else if (pos === "enter") {
+        // In view at load. Animate rather than snap, so above-the-fold
+        // content behaves the same as the GSAP tier does.
+        enterCSS(el);
       } else {
         observer.observe(el);
       }
     });
 
+    state.cssObserver = observer;
     state.observers.push(observer);
   }
 
@@ -462,6 +590,15 @@
     });
   }
 
+  // Mobile browsers resize the viewport as the URL bar hides and shows.
+  // Left alone, ScrollTrigger recalculates on every one of those, which
+  // makes scroll-driven animations stutter and re-fire while scrolling.
+  function configureScrollTrigger() {
+    if (window.ScrollTrigger && ScrollTrigger.config) {
+      ScrollTrigger.config({ ignoreMobileResize: true });
+    }
+  }
+
   function loadGSAP() {
     if (state.gsapLoaded) return Promise.resolve();
     if (state.gsapLoading) return state.gsapPromise;
@@ -469,6 +606,7 @@
     if (window.gsap && window.ScrollTrigger) {
       state.gsapLoaded = true;
       gsap.registerPlugin(ScrollTrigger);
+      configureScrollTrigger();
       log("Using existing GSAP on page.");
       return Promise.resolve();
     }
@@ -497,6 +635,7 @@
       })
       .then(function () {
         gsap.registerPlugin(ScrollTrigger);
+        configureScrollTrigger();
         state.gsapLoaded = true;
         state.gsapLoading = false;
         log("GSAP + ScrollTrigger loaded dynamically.");
@@ -515,16 +654,17 @@
   // 7. TEXT SPLITTER
   // ════════════════════════════════════════════════════════
   
-  function splitContent(el, type) {
-    el.setAttribute("aria-label", el.textContent);
+  // Elements that carry meaning with no text of their own. A line containing
+  // only one of these still has content and must not be pruned away.
+  var VOID_CONTENT = /^(IMG|SVG|VIDEO|CANVAS|INPUT|PICTURE|IFRAME|OBJECT|EMBED)$/;
 
-    var hasHTML = el.querySelector("a, strong, em, span, b, i, u, mark, sup, sub");
-    if (hasHTML) {
-      warn(
-        "split-" + type + ": element contains inline HTML. " +
-        "Structure preserved but results may vary. Text: \"" +
-        el.textContent.substring(0, 40) + "...\""
-      );
+  function splitContent(el, type) {
+    // Splitting scatters the text across dozens of spans. Naming the element
+    // keeps it as one coherent announcement. Skipped when the element holds
+    // focusable children, because aria-label on an ancestor would mask their
+    // own accessible names.
+    if (!el.querySelector("a, button, input, select, textarea, [tabindex]")) {
+      el.setAttribute("aria-label", el.textContent.replace(/\s+/g, " ").trim());
     }
 
     if (type === "lines") return splitLines(el);
@@ -533,98 +673,232 @@
     return null;
   }
 
-  function splitLines(el) {
-    // Honor user-authored line breaks (<br>) at any depth — common in
-    // rich-text / Webflow setups where BRs may sit inside inline wrappers.
-    // Splitting on the innerHTML string lets the browser re-parse each
-    // line and gracefully balance any inline tags the BR happened to cross.
-    if (el.querySelector("br")) {
-      var lineHTMLs = el.innerHTML.split(/<br\s*\/?>/i);
-      el.innerHTML = "";
-      lineHTMLs.forEach(function (lineHTML) {
-        var probe = document.createElement("span");
-        probe.innerHTML = lineHTML;
-        var isEmpty = !probe.textContent.trim();
+  // Wraps every token (word AND whitespace run) of el's text in an indexed
+  // probe span, in place, without disturbing the surrounding markup.
+  //
+  // Whitespace gets a probe too, even though it is never measured: it means a
+  // line is a contiguous index range, so rebuilding a line preserves the
+  // author's exact spacing instead of us guessing where to re-insert " ".
+  function markTokens(el) {
+    var idx = 0;
+    var words = [];
 
-        var outer = document.createElement("span");
-        outer.style.display = "block";
-        outer.style.overflow = "hidden";
-        // Bottom padding prevents descender clipping (g, y, p, etc.);
-        // negative margin keeps visual layout unchanged.
-        outer.style.paddingBottom = "0.15em";
-        outer.style.marginBottom = "-0.15em";
-
-        // Empty segments (e.g. consecutive <br><br>) render as a blank
-        // spacer line so user-authored vertical gaps are preserved.
-        if (isEmpty) {
-          outer.innerHTML = "&nbsp;";
-          el.appendChild(outer);
-          return;
-        }
-
-        var inner = document.createElement("span");
-        inner.style.display = "inline-block";
-        inner.style.willChange = "transform, opacity";
-        inner.classList.add("hm-line");
-        inner.innerHTML = lineHTML;
-        outer.appendChild(inner);
-        el.appendChild(outer);
-      });
-      return el.querySelectorAll(".hm-line");
-    }
-
-    var measuredWords = [];
     walkTextNodes(el, function (textNode) {
-      var fragments = textNode.textContent.split(/(\s+)/);
+      var text = textNode.textContent;
+      if (!text) return;
+
       var frag = document.createDocumentFragment();
-      fragments.forEach(function (p) {
-        if (/^\s+$/.test(p)) {
-          frag.appendChild(document.createTextNode(p));
-        } else if (p) {
-          var s = document.createElement("span");
-          s.textContent = p;
-          s.className = "hm-measure";
-          s.style.display = "inline";
-          frag.appendChild(s);
-          measuredWords.push(s);
-        }
+      text.split(/(\s+)/).forEach(function (piece) {
+        if (!piece) return;
+        var s = document.createElement("span");
+        s.className = "hm-measure";
+        s.style.display = "inline";
+        s.setAttribute("data-hm-i", idx);
+        s.textContent = piece;
+        frag.appendChild(s);
+        if (!/^\s+$/.test(piece)) words.push({ node: s, i: idx });
+        idx++;
       });
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
-    var lineGroups = [];
-    var currentGroup = [];
-    var currentTop = null;
-    measuredWords.forEach(function (w) {
-      var top = w.getBoundingClientRect().top;
-      if (currentTop === null || Math.abs(top - currentTop) < 4) {
-        currentGroup.push(w);
-        if (currentTop === null) currentTop = top;
+    return words;
+  }
+
+  // Reads probes and <br> elements back in document order. A separate pass is
+  // needed because <br> is not a text node, so markTokens never sees it, yet
+  // its position between words decides where lines break.
+  function orderedTokens(el) {
+    var out = [];
+    var walker = document.createTreeWalker(
+      el, NodeFilter.SHOW_ELEMENT, null, false
+    );
+    while (walker.nextNode()) {
+      var n = walker.currentNode;
+      if (n.nodeName === "BR") {
+        out.push({ br: true });
+      } else if (n.classList && n.classList.contains("hm-measure")) {
+        if (/^\s*$/.test(n.textContent)) continue;
+        out.push({ br: false, node: n, i: +n.getAttribute("data-hm-i") });
+      }
+    }
+    return out;
+  }
+
+  function unwrapMeasures(root) {
+    var probes = root.querySelectorAll(".hm-measure");
+    for (var i = 0; i < probes.length; i++) {
+      var p = probes[i];
+      var parent = p.parentNode;
+      while (p.firstChild) parent.insertBefore(p.firstChild, p);
+      parent.removeChild(p);
+    }
+    if (root.normalize) root.normalize();
+  }
+
+  // Drops wrappers left hollow after the out-of-range tokens were removed —
+  // e.g. a <span class="accent"> whose words all belong to a different line.
+  // Bottom-up so a wrapper emptied by this pass is itself reconsidered.
+  function pruneEmpty(root) {
+    var els = Array.prototype.slice.call(root.querySelectorAll("*"));
+    for (var i = els.length - 1; i >= 0; i--) {
+      var e = els[i];
+      if (e.classList && e.classList.contains("hm-measure")) continue;
+      if (VOID_CONTENT.test(e.nodeName)) continue;
+      if (e.querySelector(".hm-measure")) continue;
+      if (e.textContent.trim()) continue;
+      if (e.querySelector("img,svg,video,canvas,input,picture,iframe")) continue;
+      if (e.parentNode) e.parentNode.removeChild(e);
+    }
+  }
+
+  // Each line is cut from a full clone, so an id inside the split text would
+  // otherwise be duplicated once per line. First line wins; later ones lose
+  // the attribute rather than the element.
+  function dedupeIds(root, seen) {
+    var ided = root.querySelectorAll("[id]");
+    for (var i = 0; i < ided.length; i++) {
+      var id = ided[i].id;
+      if (seen[id]) ided[i].removeAttribute("id");
+      else seen[id] = true;
+    }
+  }
+
+  // Builds one line as a fragment that keeps the full ancestor chain.
+  //
+  // Deep-cloning the whole element and subtracting the tokens that belong to
+  // other lines is what preserves markup: a wrapper spanning two lines is
+  // reproduced in both, each holding only its own share of the words. Range
+  // extraction cannot do this — the DOM spec drops the range's common
+  // ancestor, so a heading wrapped entirely in one <span> would lose it.
+  function buildLineFragment(el, fromIdx, toIdx, seenIds) {
+    var clone = el.cloneNode(true);
+
+    // Line structure is explicit from here on; author <br>s would double it.
+    var brs = clone.querySelectorAll("br");
+    for (var i = 0; i < brs.length; i++) {
+      brs[i].parentNode.removeChild(brs[i]);
+    }
+
+    var probes = clone.querySelectorAll(".hm-measure");
+    for (var j = 0; j < probes.length; j++) {
+      var p = probes[j];
+      var n = +p.getAttribute("data-hm-i");
+      var keep = n >= fromIdx && n <= toIdx;
+
+      // Also keep the whitespace that followed the line's last word. Lines
+      // are separate blocks visually, but textContent concatenates them, so
+      // without this the text copies out as "...epsilonzeta". A trailing
+      // space at the end of a line box is not rendered, so it costs nothing.
+      if (!keep && n === toIdx + 1 && /^\s+$/.test(p.textContent)) keep = true;
+
+      if (!keep) p.parentNode.removeChild(p);
+    }
+
+    pruneEmpty(clone);
+    dedupeIds(clone, seenIds);
+    unwrapMeasures(clone);
+
+    var frag = document.createDocumentFragment();
+    while (clone.firstChild) frag.appendChild(clone.firstChild);
+    return frag;
+  }
+
+  function makeLineMask() {
+    var outer = document.createElement("span");
+    outer.className = "hm-line-mask";
+    outer.style.display = "block";
+    outer.style.overflow = "hidden";
+    // Bottom padding prevents descender clipping (g, y, p, etc.);
+    // negative margin keeps visual layout unchanged.
+    outer.style.paddingBottom = "0.15em";
+    outer.style.marginBottom = "-0.15em";
+    return outer;
+  }
+
+  // Splits into visual lines, preserving every wrapper, class and attribute.
+  //
+  // Author <br>s need no special case: the words after one measure to a new
+  // top, so the same measurement pass that detects natural wrapping detects
+  // them too. Only consecutive <br>s need explicit handling, since a blank
+  // line has no word to measure.
+  function splitLines(el) {
+    var words = markTokens(el);
+    if (!words.length) {
+      unwrapMeasures(el);
+      return null;
+    }
+
+    var tol = lineTolerance(el);
+    var lines = [];        // {from, to} index ranges; null = blank spacer line
+    var cur = null;
+    var curTop = null;
+    var afterBreak = false;
+
+    orderedTokens(el).forEach(function (t) {
+      if (t.br) {
+        if (cur) {
+          lines.push(cur);
+          cur = null;
+          curTop = null;
+        } else if (afterBreak) {
+          // <br><br> with no word between: an intentional vertical gap.
+          lines.push(null);
+        }
+        afterBreak = true;
+        return;
+      }
+
+      afterBreak = false;
+      var top = t.node.getBoundingClientRect().top;
+
+      if (!cur) {
+        cur = { from: t.i, to: t.i };
+        curTop = top;
+      } else if (Math.abs(top - curTop) < tol) {
+        cur.to = t.i;
       } else {
-        lineGroups.push(currentGroup);
-        currentGroup = [w];
-        currentTop = top;
+        lines.push(cur);
+        cur = { from: t.i, to: t.i };
+        curTop = top;
       }
     });
-    if (currentGroup.length) lineGroups.push(currentGroup);
+    if (cur) lines.push(cur);
 
+    // Every fragment is cut from a clone of the still-intact element, so all
+    // of them must be built before el is emptied.
+    var seenIds = {};
+    var fragments = lines.map(function (ln) {
+      return ln ? buildLineFragment(el, ln.from, ln.to, seenIds) : null;
+    });
+
+    markSelfMutation();
     el.innerHTML = "";
-    lineGroups.forEach(function (words) {
-      var outer = document.createElement("span");
-      outer.style.display = "block";
-      outer.style.overflow = "hidden";
-      outer.style.paddingBottom = "0.15em";
-      outer.style.marginBottom = "-0.15em";
+
+    // Each mask pads its bottom to save descenders from the overflow:hidden
+    // clip and cancels that padding with a negative margin. On a plain block
+    // the last mask's negative margin collapses out through the parent, so
+    // the parent measures ~0.15em taller than the text it contains — visible
+    // as soon as it has a background, border, or is a flex/grid item.
+    // A block formatting context keeps that margin inside, where it cancels.
+    // Only applied to plain blocks, so authored display values are left be.
+    if (!el.style.display && window.getComputedStyle(el).display === "block") {
+      el.style.display = "flow-root";
+    }
+
+    fragments.forEach(function (frag) {
+      var outer = makeLineMask();
+
+      if (!frag) {
+        outer.innerHTML = "&nbsp;";
+        el.appendChild(outer);
+        return;
+      }
+
       var inner = document.createElement("span");
+      inner.className = "hm-line";
       inner.style.display = "inline-block";
-      inner.style.willChange = "transform, opacity";
-      inner.classList.add("hm-line");
-      words.forEach(function (w, i) {
-        inner.appendChild(document.createTextNode(w.textContent));
-        if (i < words.length - 1) {
-          inner.appendChild(document.createTextNode(" "));
-        }
-      });
+      inner.appendChild(frag);
       outer.appendChild(inner);
       el.appendChild(outer);
     });
@@ -632,6 +906,14 @@
     return el.querySelectorAll(".hm-line");
   }
 
+  // Wraps each word in place. Inline markup around the words is left exactly
+  // as authored — walkTextNodes only ever touches text nodes, so an <a> or
+  // <em> keeps its tag, classes and styling and simply ends up containing
+  // .hm-word spans.
+  //
+  // Earlier versions also tagged those wrappers as .hm-word themselves, which
+  // animated the wrapper and its words independently (compounding transforms)
+  // and forced display:inline-block onto wrappers, breaking text wrapping.
   function splitWords(el) {
     walkTextNodes(el, function (textNode) {
       var fragments = textNode.textContent.split(/(\s+)/);
@@ -643,22 +925,12 @@
           var s = document.createElement("span");
           s.textContent = p;
           s.style.display = "inline-block";
-          s.style.willChange = "transform, opacity";
           s.classList.add("hm-word");
           frag.appendChild(s);
         }
       });
       textNode.parentNode.replaceChild(frag, textNode);
     });
-
-    el.querySelectorAll("a, strong, em, span:not(.hm-word), b, i").forEach(
-      function (node) {
-        if (!node.classList.contains("hm-word")) {
-          node.style.display = "inline-block";
-          node.classList.add("hm-word");
-        }
-      }
-    );
 
     return el.querySelectorAll(".hm-word");
   }
@@ -685,7 +957,6 @@
           var s = document.createElement("span");
           s.textContent = c;
           s.style.display = "inline-block";
-          s.style.willChange = "transform, opacity";
           s.classList.add("hm-char");
           wordWrap.appendChild(s);
         }
@@ -708,9 +979,205 @@
 
 
   // ════════════════════════════════════════════════════════
+  // 7b. SPLIT ANIMATION RUNNER
+  // ════════════════════════════════════════════════════════
+
+  // Every split animation is the same shape — cut the text up, offset the
+  // pieces, stagger them back to rest — so they share one runner. That runner
+  // is also the single place where measurement can be deferred or repeated,
+  // which is what makes splits behave the same on every page.
+  var SPLIT_PRESETS = {
+    "split-lines": {
+      type: "lines", from: { y: "110%" }, to: { y: "0%" },
+      duration: 0.9, ease: "power3.out", stagger: 0.12, scrolled: true,
+    },
+    "split-words": {
+      type: "words", from: { y: 20 }, to: { y: 0 },
+      duration: 0.6, ease: "power2.out", stagger: 0.04, scrolled: true,
+    },
+    "split-chars": {
+      type: "chars", from: { y: 15 }, to: { y: 0 },
+      duration: 0.5, ease: "power2.out", stagger: 0.02, scrolled: true,
+    },
+    "hero-text": {
+      type: "lines", from: { y: "120%" }, to: { y: "0%" },
+      duration: 1, ease: "power4.out", stagger: 0.15, delay: 0.3,
+      scrolled: false,
+    },
+  };
+
+  function findSplit(el) {
+    for (var i = 0; i < state.splits.length; i++) {
+      if (state.splits[i].el === el) return state.splits[i];
+    }
+    return null;
+  }
+
+  // Waits for an element to gain layout before splitting it. Covers tabs,
+  // sliders and accordions, whose panels are display:none at init.
+  function deferUntilMeasurable(el, run) {
+    if (!window.ResizeObserver) return false;
+    var ro = new ResizeObserver(function () {
+      if (!isMeasurable(el)) return;
+      ro.disconnect();
+      run();
+      if (state.gsapLoaded) ScrollTrigger.refresh();
+    });
+    ro.observe(el);
+    state.observers.push(ro);
+    return true;
+  }
+
+  function runSplit(el, preset, instant) {
+    // Captured before the first split; every re-measure restores from this.
+    if (!state.originalHTML.has(el)) {
+      state.originalHTML.set(el, el.innerHTML);
+    }
+
+    // Splitting rewrites this element's DOM; keep the CMS observer off it.
+    markSelfMutation();
+
+    if (!isMeasurable(el)) {
+      // Show it rather than leave it blank, and split once it has a size.
+      el.style.opacity = "1";
+      if (!deferUntilMeasurable(el, function () {
+        el.style.opacity = "";
+        el.innerHTML = state.originalHTML.get(el);
+        runSplit(el, preset, instant);
+      })) {
+        warn(
+          "Cannot measure element for split-" + preset.type +
+          " (hidden or zero-width) and ResizeObserver is unavailable. " +
+          "Shown without animation."
+        );
+      }
+      return;
+    }
+
+    var parts = splitContent(el, preset.type);
+    if (!parts || !parts.length) {
+      el.style.opacity = "1";
+      return;
+    }
+    var arr = Array.prototype.slice.call(parts);
+
+    var rec = findSplit(el);
+    if (!rec) {
+      rec = { el: el, played: false };
+      state.splits.push(rec);
+      ensureResizeWatcher();
+    }
+    rec.preset = preset;
+    rec.parts = arr;
+
+    // Re-measured after the animation already ran: land on the final state
+    // without replaying it.
+    if (instant) {
+      gsap.set(arr, mergeTo(preset));
+      rec.played = true;
+      return;
+    }
+
+    gsap.set(arr, mergeFrom(preset));
+
+    var vars = mergeTo(preset);
+    vars.duration = getDuration(el, preset.duration);
+    vars.ease = getEase(el, preset.ease);
+    vars.stagger = getStagger(el, preset.stagger);
+
+    // An explicit data-hm-delay of 0 must win over the preset's default,
+    // so test for the attribute rather than for a falsy value.
+    vars.delay = el.getAttribute("data-hm-delay") !== null
+      ? getDelay(el)
+      : (preset.delay || 0);
+
+    // Promote on start, not on creation: a scroll-triggered split may sit
+    // below the fold for a long time, and holding a compositing layer per
+    // waiting element is what makes long pages feel heavy.
+    vars.onStart = function () {
+      setWillChange(arr, "transform, opacity");
+    };
+    vars.onComplete = function () {
+      rec.played = true;
+      setWillChange(arr, "auto");
+    };
+
+    // Load animations (hero-*) normally fire immediately. If the element is
+    // below the fold — a restored scroll position, a long page, an anchor
+    // link — playing blind wastes the animation, so fall back to scroll.
+    if (preset.scrolled || !isInViewport(el)) {
+      vars.scrollTrigger = scrollCfg(el);
+    }
+
+    var tween = gsap.to(arr, vars);
+    rec.tween = tween;
+    trackTrigger(tween);
+  }
+
+  function mergeFrom(preset) {
+    var o = { opacity: 0 };
+    for (var k in preset.from) o[k] = preset.from[k];
+    return o;
+  }
+
+  function mergeTo(preset) {
+    var o = { opacity: 1 };
+    for (var k in preset.to) o[k] = preset.to[k];
+    return o;
+  }
+
+  // Re-measures every split against the current layout.
+  //
+  // Line boxes are baked in at split time, so once the text rewraps — a
+  // resize, a rotation, a webfont arriving late — the old boxes no longer
+  // match and the overflow:hidden masks clip the text. Restoring the pristine
+  // markup and splitting again is the only way to stay correct.
+  function rebuildSplits() {
+    if (!state.gsapLoaded || !state.splits.length) return;
+
+    markSelfMutation();
+
+    state.splits.forEach(function (rec) {
+      var html = state.originalHTML.get(rec.el);
+      if (html == null || !rec.el.isConnected) return;
+
+      // Mid-flight: restarting would visibly jump. It will be re-measured on
+      // the next change, and the current layout is still the one it began in.
+      if (rec.tween && rec.tween.isActive()) return;
+
+      if (rec.tween) {
+        untrackTrigger(rec.tween);
+        if (rec.tween.scrollTrigger) rec.tween.scrollTrigger.kill();
+        rec.tween.kill();
+        rec.tween = null;
+      }
+      if (rec.parts) gsap.killTweensOf(rec.parts);
+
+      rec.el.innerHTML = html;
+      runSplit(rec.el, rec.preset, rec.played);
+    });
+
+    ScrollTrigger.refresh();
+  }
+
+  function ensureResizeWatcher() {
+    if (state.resizeBound) return;
+    state.resizeBound = true;
+    state.lastWidth = window.innerWidth;
+
+    addListener(window, "resize", debounce(function () {
+      // Width-only. Mobile browsers fire resize constantly as the URL bar
+      // hides and shows, and a height change never rewraps text.
+      if (window.innerWidth === state.lastWidth) return;
+      state.lastWidth = window.innerWidth;
+      rebuildSplits();
+    }, CONFIG.resizeDebounce));
+  }
+
+  // ════════════════════════════════════════════════════════
   // 8. GSAP SCROLL ANIMATIONS
   // ════════════════════════════════════════════════════════
-  
+
   var gsapScrollAnims = {
 
     "fade-up": function (el) {
@@ -770,6 +1237,7 @@
     },
 
     "fade-in": function (el) {
+      primeWillChange(el, "opacity");
       gsap.set(el, { opacity: 0 });
       var t = gsap.to(el, {
         opacity: 1,
@@ -783,6 +1251,7 @@
     },
 
     "scale-in": function (el) {
+      primeWillChange(el);
       gsap.set(el, { opacity: 0, scale: 0.9 });
       var t = gsap.to(el, {
         opacity: 1, scale: 1,
@@ -797,6 +1266,7 @@
     },
 
     "reveal-up": function (el) {
+      primeWillChange(el, "clip-path");
       gsap.set(el, { clipPath: "inset(100% 0% 0% 0%)" });
       var t = gsap.to(el, {
         clipPath: "inset(0% 0% 0% 0%)",
@@ -811,61 +1281,16 @@
 
     // ── Text splits ──────────────────────────────────────
 
-    "split-lines": function (el) {
-      var parts = splitContent(el, "lines");
-      if (!parts || !parts.length) return;
-      var partsArr = Array.prototype.slice.call(parts);
-      gsap.set(partsArr, { y: "110%", opacity: 0 });
-      gsap.to(partsArr, {
-        y: "0%", opacity: 1,
-        duration: getDuration(el, 0.9),
-        ease: getEase(el, "power3.out"),
-        stagger: getStagger(el, 0.12),
-        delay: getDelay(el),
-
-        scrollTrigger: scrollCfg(el),
-        onComplete: function () {
-          partsArr.forEach(function (p) { clearWillChange(p); });
-        },
-      });
+    "split-lines": function (el, instant) {
+      runSplit(el, SPLIT_PRESETS["split-lines"], instant);
     },
 
-    "split-words": function (el) {
-      var parts = splitContent(el, "words");
-      if (!parts || !parts.length) return;
-      var partsArr = Array.prototype.slice.call(parts);
-      gsap.set(partsArr, { y: 20, opacity: 0 });
-      gsap.to(partsArr, {
-        y: 0, opacity: 1,
-        duration: getDuration(el, 0.6),
-        ease: getEase(el, "power2.out"),
-        stagger: getStagger(el, 0.04),
-        delay: getDelay(el),
-
-        scrollTrigger: scrollCfg(el),
-        onComplete: function () {
-          partsArr.forEach(function (p) { clearWillChange(p); });
-        },
-      });
+    "split-words": function (el, instant) {
+      runSplit(el, SPLIT_PRESETS["split-words"], instant);
     },
 
-    "split-chars": function (el) {
-      var parts = splitContent(el, "chars");
-      if (!parts || !parts.length) return;
-      var partsArr = Array.prototype.slice.call(parts);
-      gsap.set(partsArr, { y: 15, opacity: 0 });
-      gsap.to(partsArr, {
-        y: 0, opacity: 1,
-        duration: getDuration(el, 0.5),
-        ease: getEase(el, "power2.out"),
-        stagger: getStagger(el, 0.02),
-        delay: getDelay(el),
-
-        scrollTrigger: scrollCfg(el),
-        onComplete: function () {
-          partsArr.forEach(function (p) { clearWillChange(p); });
-        },
-      });
+    "split-chars": function (el, instant) {
+      runSplit(el, SPLIT_PRESETS["split-chars"], instant);
     },
 
     // ── Image reveal ─────────────────────────────────────
@@ -894,6 +1319,7 @@
           break;
       }
 
+      primeWillChange(el, "clip-path");
       gsap.set(el, { clipPath: clipFrom });
 
       var t = gsap.to(el, {
@@ -930,6 +1356,7 @@
       var start = getScrollStart(el);
 
       // Hide all children immediately
+      setWillChange(children, "transform, opacity");
       gsap.set(children, { opacity: 0, y: dist });
 
       // Group children into visual rows by their vertical position
@@ -937,7 +1364,7 @@
       var rows = [];
       var currentRow = [];
       var currentTop = null;
-      var tolerance = 10; // px â€” accounts for subpixel differences
+      var tolerance = 10; // px — accounts for subpixel differences
 
       children.forEach(function (child) {
         var top = child.getBoundingClientRect().top;
@@ -952,7 +1379,7 @@
       });
       if (currentRow.length) rows.push(currentRow);
 
-      // Each row gets its own ScrollTrigger â€” children within
+      // Each row gets its own ScrollTrigger — children within
       // a row stagger sequentially when that row enters view
       rows.forEach(function (row) {
         var t = gsap.to(row, {
@@ -1075,34 +1502,26 @@
   // ════════════════════════════════════════════════════════
   
   var gsapLoadAnims = {
-    "hero-text": function (el) {
-      var parts = splitContent(el, "lines");
-      if (!parts || !parts.length) return;
-      var partsArr = Array.prototype.slice.call(parts);
-      gsap.set(partsArr, { y: "120%", opacity: 0 });
-      gsap.to(partsArr, {
-        y: "0%", opacity: 1,
-        duration: getDuration(el, 1),
-        ease: getEase(el, "power4.out"),
-        stagger: getStagger(el, 0.15),
-        delay: getDelay(el) || 0.3,
-
-        onComplete: function () {
-          partsArr.forEach(function (p) { clearWillChange(p); });
-        },
-      });
+    "hero-text": function (el, instant) {
+      runSplit(el, SPLIT_PRESETS["hero-text"], instant);
     },
 
     "hero-image": function (el) {
+      primeWillChange(el);
       gsap.set(el, { opacity: 0, scale: 1.05 });
-      gsap.to(el, {
+
+      var vars = {
         opacity: 1, scale: 1,
         duration: getDuration(el, 1.4),
         ease: getEase(el, "power3.out"),
         delay: getDelay(el) || 0.2,
-
         onComplete: function () { clearWillChange(el); },
-      });
+      };
+
+      // Same reasoning as hero-text: don't play it where nobody can see it.
+      if (!isInViewport(el)) vars.scrollTrigger = scrollCfg(el);
+
+      trackTrigger(gsap.to(el, vars));
     },
   };
 
@@ -1252,18 +1671,18 @@
         return;
       }
 
-      // CSS tier elements were already handled â€” skip
+      // CSS tier elements were already handled — skip
       if (CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) return;
 
       // GSAP scroll animations
       if (gsapScrollAnims[type] && state.gsapLoaded) {
-        gsapScrollAnims[type](el);
+        gsapScrollAnims[type](el, false);
         return;
       }
 
       // GSAP load animations
       if (gsapLoadAnims[type] && state.gsapLoaded) {
-        gsapLoadAnims[type](el);
+        gsapLoadAnims[type](el, false);
         return;
       }
     }
@@ -1285,6 +1704,10 @@
     if (!window.MutationObserver) return;
 
     var handleMutations = debounce(function () {
+      // Splitting text rewrites innerHTML, which trips this observer. Without
+      // this guard every split schedules a full-document rescan.
+      if (Date.now() - state.lastSelfMutation < 400) return;
+
       var newEls = document.querySelectorAll("[data-animate], [data-btn]");
       var needsGSAP = false;
 
@@ -1300,12 +1723,17 @@
 
         if (type && CSS_TIER.indexOf(type) > -1 && !state.gsapLoaded) {
           applyCSSOverrides(el);
-          if (isInViewport(el)) {
+          var pos = initialPosition(el);
+          if (pos === "played") {
             el.classList.add("hm-visible");
+          } else if (pos === "enter") {
+            enterCSS(el);
+          } else if (state.cssObserver) {
+            state.cssObserver.observe(el);
           } else {
-            state.observers.forEach(function (obs) {
-              obs.observe(el);
-            });
+            // CMS content arrived on a page that had no CSS-tier elements at
+            // init, so no observer exists yet. Build one around this element.
+            initCSSTier([el]);
           }
           state.processedEls.add(el);
         }
@@ -1371,41 +1799,56 @@
 
     if (needsGSAP) {
       loadGSAP().then(function () {
-        // Process elements in batches via rAF to avoid
-        // blocking the main thread and causing jank
-        var gsapEls = allEls.concat(btnEls);
-        var BATCH = 10;
-        var idx = 0;
+        if (!state.gsapLoaded) return;   // CDN failed; fallback already active
 
-        function processBatch() {
-          var end = Math.min(idx + BATCH, gsapEls.length);
-          for (var i = idx; i < end; i++) {
-            processElement(gsapEls[i]);
+        // Text splits measure line wrapping, which is wrong until the real
+        // fonts are in. Waiting here costs a little time up front and saves
+        // every split from being laid out against fallback metrics.
+        whenFontsReady(function () {
+          // Process elements in batches via rAF to avoid
+          // blocking the main thread and causing jank
+          var gsapEls = allEls.concat(btnEls);
+          var BATCH = 10;
+          var idx = 0;
+
+          function processBatch() {
+            var end = Math.min(idx + BATCH, gsapEls.length);
+            for (var i = idx; i < end; i++) {
+              processElement(gsapEls[i]);
+            }
+            idx = end;
+            if (idx < gsapEls.length) {
+              requestAnimationFrame(processBatch);
+            } else {
+              // All elements processed — safe to remove early-hide now
+              // that GSAP has set initial states on all elements
+              finishInit();
+              ScrollTrigger.refresh();
+            }
           }
-          idx = end;
-          if (idx < gsapEls.length) {
-            requestAnimationFrame(processBatch);
+
+          requestAnimationFrame(processBatch);
+
+          // Recalculate positions after all images/fonts load
+          if (document.readyState === "complete") {
+            setTimeout(function () { ScrollTrigger.refresh(); }, 100);
           } else {
-            // All elements processed â€” safe to remove early-hide now
-            // that GSAP has set initial states on all elements
-            finishInit();
-            ScrollTrigger.refresh();
+            addListener(window, "load", function () {
+              ScrollTrigger.refresh();
+            });
           }
-        }
 
-        requestAnimationFrame(processBatch);
-
-        // Recalculate positions after all images/fonts load
-        if (document.readyState === "complete") {
-          setTimeout(function () { ScrollTrigger.refresh(); }, 100);
-        } else {
-          window.addEventListener("load", function () {
-            ScrollTrigger.refresh();
-          });
-        }
+          // A font slower than CONFIG.fontTimeout still lands eventually and
+          // rewraps the text under the splits we just measured.
+          if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(function () {
+              if (state.initialized) rebuildSplits();
+            }).catch(function () {});
+          }
+        });
       });
     } else {
-      log("CSS-only mode â€” no GSAP needed.");
+      log("CSS-only mode — no GSAP needed.");
       finishInit();
     }
   }
@@ -1415,7 +1858,7 @@
     document.documentElement.classList.remove("hm-loading");
     document.documentElement.classList.add("hm-ready");
 
-    // Remove the early-hide stylesheet â€” all elements are now either
+    // Remove the early-hide stylesheet — all elements are now either
     // hidden by GSAP (gsap.set) or by the CSS pre-animation rules,
     // so this blanket !important hide is no longer needed.
     var earlyHide = document.getElementById("hm-early-hide");
@@ -1433,6 +1876,11 @@
   // ════════════════════════════════════════════════════════
   
   function destroy() {
+    if (state.foicTimer) {
+      clearTimeout(state.foicTimer);
+      state.foicTimer = null;
+    }
+
     state.triggers.forEach(function (st) {
       if (st && st.kill) st.kill();
     });
@@ -1442,11 +1890,13 @@
       obs.disconnect();
     });
     state.observers = [];
+    state.cssObserver = null;
 
     state.listeners.forEach(function (l) {
       l.el.removeEventListener(l.evt, l.fn);
     });
     state.listeners = [];
+    state.resizeBound = false;
 
     if (state.mutationObs) {
       state.mutationObs.disconnect();
@@ -1460,6 +1910,40 @@
       });
     }
 
+    // Put split text back the way the author wrote it. Without this a
+    // reinit() would split the already-split markup, nesting line masks
+    // inside line masks until the layout collapses.
+    markSelfMutation();
+    state.splits.forEach(function (rec) {
+      var html = state.originalHTML.get(rec.el);
+      if (html != null && rec.el.isConnected) {
+        rec.el.innerHTML = html;
+        rec.el.removeAttribute("aria-label");
+        rec.el.style.opacity = "";
+        if (rec.el.style.display === "flow-root") rec.el.style.display = "";
+      }
+    });
+    state.splits = [];
+    state.originalHTML = new WeakMap();
+
+    // Remove injected stylesheets, or a reinit stacks duplicates and the
+    // pre-animation rules keep hiding content that nothing will reveal.
+    state.styles.forEach(function (s) {
+      if (s.parentNode) s.parentNode.removeChild(s);
+    });
+    state.styles = [];
+
+    var earlyHide = document.getElementById("hm-early-hide");
+    if (earlyHide && earlyHide.parentNode) {
+      earlyHide.parentNode.removeChild(earlyHide);
+    }
+
+    // Animation state classes outlive the stylesheet that gave them meaning.
+    var marked = document.querySelectorAll(".hm-in, .hm-visible, .hm-done");
+    for (var i = 0; i < marked.length; i++) {
+      marked[i].classList.remove("hm-in", "hm-visible", "hm-done");
+    }
+
     state.processedEls = new WeakSet();
     state.initialized = false;
 
@@ -1470,8 +1954,14 @@
     log("Destroyed.");
   }
 
+  // Call after anything that changes layout — a tab opening, a filter
+  // rerendering a grid, a font swap. Split text is re-measured against the
+  // new layout, not just repositioned.
   function refresh() {
-    if (state.gsapLoaded) ScrollTrigger.refresh();
+    if (state.gsapLoaded) {
+      if (state.splits.length) rebuildSplits();   // refreshes ScrollTrigger
+      else ScrollTrigger.refresh();
+    }
     log("Refreshed.");
   }
 
